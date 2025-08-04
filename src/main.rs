@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-use std::net::TcpListener;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
@@ -8,12 +8,23 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                let mut buf = Vec::<u8>::new();
-                stream.read_to_end(&mut buf).expect("Stream should read successfully");
-                if let Ok(commands) = String::from_utf8(buf) {
-                    for _ in commands.split_whitespace()
-                    {
-                        stream.write_all(b"+PONG\r\n").unwrap();
+                let mut buf = [0; 1024];
+
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let input = String::from_utf8_lossy(&buf[..n]);
+                            for _ in input.rmatches("PING") {
+                                stream
+                                    .write_all(b"+PONG\r\n")
+                                    .expect("Should be able to write PONG to stream");
+                                stream.flush().unwrap();
+                            }
+
+                            buf = [0; 1024];
+                        }
+                        Err(_) => break,
                     }
                 }
             }
