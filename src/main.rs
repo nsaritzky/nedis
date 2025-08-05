@@ -1,36 +1,40 @@
 #![allow(unused_imports)]
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use tokio::{
+    io::{self, AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let mut buf = [0; 1024];
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
 
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let input = String::from_utf8_lossy(&buf[..n]);
-                            for _ in input.rmatches("PING") {
-                                stream
-                                    .write_all(b"+PONG\r\n")
-                                    .expect("Should be able to write PONG to stream");
-                                stream.flush().unwrap();
-                            }
+        tokio::spawn(async move {
+            process(socket).await;
+        });
+    }
+}
 
-                            buf = [0; 1024];
-                        }
-                        Err(_) => break,
-                    }
+async fn process(mut socket: TcpStream) {
+    let mut buf = [0; 1024];
+
+    loop {
+        match socket.read(&mut buf).await {
+            Ok(0) => {
+                break
+            },
+            Ok(n) => {
+                let input = String::from_utf8_lossy(&buf[..n]);
+                for _ in input.rmatches("PING") {
+                    socket.write_all(b"+PONG\r\n").await.expect("Should be able to write PONG");
+                    socket.flush().await.unwrap();
                 }
+
+                buf = [0; 1024];
             }
-            Err(e) => {
-                println!("error: {}", e);
-            }
+            Err(_) => break,
         }
     }
 }
