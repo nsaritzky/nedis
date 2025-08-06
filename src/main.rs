@@ -330,11 +330,26 @@ async fn handle_lpop(
         let mut db = db.lock().await;
 
         if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(key) {
-            let resp = array.pop_front();
-            if let Some(resp) = resp {
-                send_response(socket, &resp.to_bytes()).await
+            if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(n))) = v.get(*i + 1) {
+                *i += 1;
+
+                let n: usize = n.parse()?;
+                if n >= array.len() {
+                    let resp_vec: VecDeque<_> = array.drain(..).collect();
+
+                    send_response(socket, &RedisValue::Arr(resp_vec).to_bytes()).await
+                } else {
+                    let resp_vec: VecDeque<_> = array.drain(..n).collect();
+
+                    send_response(socket, &RedisValue::Arr(resp_vec).to_bytes()).await
+                }
             } else {
-                send_response(socket, empty_response).await
+                let resp = array.pop_front();
+                if let Some(resp) = resp {
+                    send_response(socket, &resp.to_bytes()).await
+                } else {
+                    send_response(socket, empty_response).await
+                }
             }
         } else {
             send_response(socket, empty_response).await
