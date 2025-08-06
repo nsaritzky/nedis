@@ -24,7 +24,7 @@ use tokio::{
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
-type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<StreamElement>>>>;
+type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -501,10 +501,10 @@ async fn handle_xadd(
     if let Some(RedisValue::Primitive(key)) = v.get(*i) {
         let mut streams = streams.lock().await;
 
-        let set = if let Some(set) = streams.get_mut(key) {
-            set
+        let stream_vec = if let Some(stream_vec) = streams.get_mut(key) {
+            stream_vec
         } else {
-            streams.insert(key.clone(), BTreeSet::new());
+            streams.insert(key.clone(), Vec::new());
             streams.get_mut(key).unwrap()
         };
 
@@ -512,6 +512,32 @@ async fn handle_xadd(
             *i += 1;
 
             let id = id.clone();
+
+            let (timestamp, sequence) = id
+                .split_once("-")
+                .expect(&format!("Invalid stream element id: {id}"));
+
+            let timestamp: u128 = timestamp.parse().expect("Invalid timestamp");
+            let sequence: usize = sequence.parse().expect("Invalid sequence number");
+
+            if timestamp == 0 && sequence == 0 {
+                return send_response(
+                    socket,
+                    b"-ERR The ID specified in XADD must be greater than 0-0\r\n",
+                )
+                .await;
+            }
+
+            let last_element = stream_vec.last();
+            if let Some(last_element) = last_element {
+                let (last_timestamp, last_sequence) = last_element.id.split_once("-").unwrap();
+                let last_timestamp: u128 = last_timestamp.parse().unwrap();
+                let last_sequence: usize = last_sequence.parse().unwrap();
+
+                if timestamp < last_timestamp || sequence <= last_sequence {
+                    return send_response(socket, b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n").await;
+                }
+            }
 
             let mut args: Vec<_> = v.drain(*i + 2..).collect();
 
@@ -524,11 +550,11 @@ async fn handle_xadd(
             }
 
             let result = StreamElement::new(id.clone(), map);
-            set.insert(result);
+            stream_vec.push(result);
 
             let resp = &RedisValue::Primitive(PrimitiveRedisValue::Str(id)).to_bytes();
             send_response(socket, resp).await
-            } else {
+        } else {
             bail!("Could not get id");
         }
     } else {
