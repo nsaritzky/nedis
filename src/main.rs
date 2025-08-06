@@ -3,7 +3,7 @@ mod parser;
 mod redis_value;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -13,34 +13,39 @@ use anyhow::{anyhow, bail};
 use bytes::BytesMut;
 use num::ToPrimitive;
 use redis_value::{PrimitiveRedisValue, RedisValue};
+use tokio::task;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
+    time::interval,
 };
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
+type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
+    let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
 
         let db = Arc::clone(&db);
+        let blocks = Arc::clone(&blocks);
 
         tokio::spawn(async move {
-            process(socket, db)
+            process(socket, db, blocks)
                 .await
                 .expect("Process should be successful");
         });
     }
 }
 
-async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
+async fn process(mut socket: TcpStream, db: Db, blocks: Blocks) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -83,6 +88,9 @@ async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
                                 }
                                 "LPOP" => {
                                     handle_lpop(&db, &mut v, &mut i, &mut socket).await?;
+                                }
+                                "BLPOP" => {
+                                    handle_blpop(&db, &blocks, &mut v, &mut i, &mut socket).await?;
                                 }
                                 _ => {}
                             }
@@ -321,7 +329,7 @@ async fn handle_lpop(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream
+    socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     let empty_response = b"$-1\r\n";
     *i += 1;
@@ -357,6 +365,59 @@ async fn handle_lpop(
     } else {
         bail!("Bad key: {:?}", v[*i]);
     }
+}
+
+async fn handle_blpop(
+    db: &Db,
+    blocks: &Blocks,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let mut interval = interval(Duration::from_millis(10));
+    *i += 1;
+
+    if let RedisValue::Primitive(key) = &v[*i] {
+        {
+            let mut blocks = blocks.lock().await;
+
+            if let Some(blocks_set) = blocks.get_mut(&key) {
+                blocks_set.insert((SystemTime::now(), task::id().to_string()));
+            } else {
+                let mut blocks_set: BTreeSet<(SystemTime, String)> = BTreeSet::new();
+                blocks_set.insert((SystemTime::now(), task::id().to_string()));
+                blocks.insert(key.clone(), blocks_set);
+            }
+        }
+
+        loop {
+            interval.tick().await;
+
+            if let Ok(mut db) = db.try_lock() {
+                if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
+                    if let Some(value) = array.pop_front() {
+                        let mut blocks = blocks.lock().await;
+                        if let Some(blocks_set) = blocks.get_mut(&key) {
+                            let (_, id) =
+                                blocks_set.first().expect("Blocks set should be nonempty");
+
+                            if *id == task::id().to_string() {
+                                blocks_set.pop_first();
+
+                                let resp_vec: VecDeque<_> =
+                                    vec![RedisValue::Primitive(key.clone()), value].into();
+
+                                let resp = &RedisValue::Arr(resp_vec).to_bytes();
+
+                                return send_response(socket, resp).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
