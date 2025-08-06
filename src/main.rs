@@ -14,6 +14,7 @@ use bytes::BytesMut;
 use itertools::Itertools;
 use num::ToPrimitive;
 use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
+use thiserror::Error;
 use tokio::task;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
@@ -511,53 +512,20 @@ async fn handle_xadd(
         if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(id))) = v.get(*i + 1) {
             *i += 1;
 
-            let id = id.clone();
-
-            let (timestamp, sequence) = id
-                .split_once("-")
-                .expect(&format!("Invalid stream element id: {id}"));
-
-            if timestamp == "0" && sequence == "0" {
-                return send_response(
-                    socket,
-                    b"-ERR The ID specified in XADD must be greater than 0-0\r\n",
-                )
-                .await;
-            }
-
-            let last_element = stream_vec.last();
-
-            let id = if let Some(last_element) = last_element {
-                let (last_timestamp, last_sequence) = last_element.id.split_once("-").unwrap();
-                let last_timestamp: u128 = last_timestamp.parse().unwrap();
-                let last_sequence: usize = last_sequence.parse().unwrap();
-
-                let timestamp: u128 = timestamp.parse().expect("Invalid timestamp");
-                let sequence: usize = if sequence == "*" {
-                    if timestamp > last_timestamp {
-                        0
-                    } else {
-                        last_sequence + 1
-                    }
-                } else {
-                    sequence.parse().expect("Invalid sequence number")
-                };
-
-                if timestamp < last_timestamp
-                    || (timestamp == last_timestamp && sequence <= last_sequence)
-                {
+            let id = match generate_and_validate_stream_id(stream_vec, id) {
+                Ok(id) => id,
+                Err(StreamIdValidationError::Zero) => {
+                    return send_response(
+                        socket,
+                        b"-ERR The ID specified in XADD must be greater than 0-0\r\n",
+                    )
+                    .await;
+                }
+                Err(StreamIdValidationError::DecreasingTimestamp)
+                | Err(StreamIdValidationError::NonincreasingSequence) => {
                     return send_response(socket, b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n").await;
                 }
-
-                format!("{timestamp}-{sequence}")
-            } else {
-                if timestamp == "0" {
-                    "0-1".to_string()
-                } else if sequence == "*" {
-                    format!("{timestamp}-0")
-                } else {
-                    format!("{timestamp}-{sequence}")
-                }
+                Err(e) => bail!(e),
             };
 
             let mut args: Vec<_> = v.drain(*i + 2..).collect();
@@ -590,4 +558,106 @@ async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()
 
 fn bulk_string<'a>(s: &'a str) -> Vec<u8> {
     format!("${}\r\n{s}\r\n", s.len()).as_bytes().to_owned()
+}
+
+fn generate_and_validate_stream_id(
+    stream_vec: &Vec<StreamElement>,
+    id: &str,
+) -> Result<String, StreamIdValidationError> {
+    if let Some(last_element) = stream_vec.last() {
+        let (last_timestamp, last_sequence) = last_element.id.split_once("-").unwrap();
+        let last_timestamp: u128 = last_timestamp.parse().unwrap();
+        let last_sequence: usize = last_sequence.parse().unwrap();
+
+        if id == "*" {
+            let current_time = SystemTime::now();
+            let since_epoch = current_time.duration_since(UNIX_EPOCH).unwrap();
+            let timestamp = since_epoch.as_millis();
+
+            let sequence = if timestamp == last_timestamp {
+                last_sequence + 1
+            } else {
+                0
+            };
+
+            Ok(format!("{timestamp}-{sequence}"))
+        } else {
+            if id == "0-0" {
+                return Err(StreamIdValidationError::Zero);
+            }
+
+            let (timestamp, sequence) = id
+                .split_once("-")
+                .ok_or(StreamIdValidationError::InvalidId(id.to_string()))?;
+
+            let timestamp: u128 = timestamp
+                .parse()
+                .map_err(|_| StreamIdValidationError::InvalidTimestamp(timestamp.to_string()))?;
+
+            let sequence = if sequence == "*" {
+                if timestamp < last_timestamp {
+                    return Err(StreamIdValidationError::DecreasingTimestamp);
+                } else if timestamp == last_timestamp {
+                    last_sequence + 1
+                } else {
+                    0
+                }
+            } else {
+                let sequence = sequence
+                    .parse()
+                    .map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?;
+                if timestamp < last_timestamp {
+                    return Err(StreamIdValidationError::DecreasingTimestamp);
+                }
+                if timestamp == last_timestamp && sequence <= last_sequence {
+                    return Err(StreamIdValidationError::NonincreasingSequence);
+                }
+                sequence
+            };
+
+            Ok(format!("{timestamp}-{sequence}"))
+        }
+    } else {
+        if id == "*" {
+            let current_time = SystemTime::now();
+            let since_epoch = current_time.duration_since(UNIX_EPOCH).unwrap();
+            let timestamp = since_epoch.as_millis();
+
+            Ok(format!("{timestamp}-0"))
+        } else {
+            let (timestamp, sequence) = id
+                .split_once("-")
+                .ok_or(StreamIdValidationError::InvalidId(id.to_string()))?;
+            let timestamp: u128 = timestamp
+                .parse()
+                .map_err(|_| StreamIdValidationError::InvalidTimestamp(timestamp.to_string()))?;
+            let sequence: usize = if sequence == "*" {
+                if timestamp == 0 {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                sequence.parse().map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?
+            };
+
+            Ok(format!("{timestamp}-{sequence}"))
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+enum StreamIdValidationError {
+    #[error("Invalid stream id: {0}")]
+    InvalidId(String),
+    #[error("Invalid timestamp: {0}")]
+    InvalidTimestamp(String),
+    #[error("Invalid sequence: {0}")]
+    InvalidSequence(String),
+    #[error("Decreasing timestamp")]
+    DecreasingTimestamp,
+    #[error("Nonincreasing sequence")]
+    NonincreasingSequence,
+    #[error("Zero id: 0-0")]
+    Zero,
 }
