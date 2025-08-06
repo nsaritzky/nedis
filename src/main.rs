@@ -219,8 +219,18 @@ async fn handle_lrange(
                 Some(RedisValue::Primitive(PrimitiveRedisValue::Str(b))),
             ) = (v.get(*i + 1), v.get(*i + 2))
             {
-                let a: usize = a.parse()?;
-                let b: usize = b.parse()?;
+                let a: isize = a.parse()?;
+                let a: usize = if a >= 0 {
+                    a.to_usize().unwrap()
+                } else {
+                    array.len().checked_add_signed(a).unwrap_or(0)
+                };
+                let b: isize = b.parse()?;
+                let b: usize = if b >= 0 {
+                    b.to_usize().unwrap()
+                } else {
+                    array.len().checked_add_signed(b).unwrap_or(0)
+                };
 
                 if a >= array.len() {
                     send_response(socket, empty_array_response).await?;
@@ -231,6 +241,7 @@ async fn handle_lrange(
                     let resp = RedisValue::Arr(array[a..=b].to_owned());
                     send_response(socket, &resp.to_bytes()).await?;
                 }
+                *i += 2;
                 Ok(())
             } else {
                 bail!("Failed to get array bounds");
