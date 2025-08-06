@@ -566,20 +566,26 @@ async fn handle_xrange(
         let streams = streams.lock().await;
 
         if let Some(stream_vec) = streams.get(key) {
-            let mut drain = v.drain(*i+1..*i+3);
+            let mut drain = v.drain(*i + 1..*i + 3);
             let start = drain.next().unwrap();
             let end = drain.next().unwrap();
 
-            let start = start.to_string().unwrap();
-            let (start_timestamp, start_sequence) = if start.contains("-") {
-                start.split_once("-").unwrap()
-            } else {
-                (start, "0")
+            let (start_timestamp, start_sequence): (u128, usize) = {
+                let start = start.to_string().unwrap();
+                if start == "-" {
+                    (0, 0)
+                } else {
+                    let (start_timestamp, start_sequence) = if start.contains("-") {
+                        start.split_once("-").unwrap()
+                    } else {
+                        (start, "0")
+                    };
+                    (
+                        start_timestamp.parse().unwrap(),
+                        start_sequence.parse().unwrap(),
+                    )
+                }
             };
-            let (start_timestamp, start_sequence): (u128, usize) = (
-                start_timestamp.parse().unwrap(),
-                start_sequence.parse().unwrap(),
-            );
             let end = end.to_string().unwrap();
             let (end_timestamp, end_sequence) = if end.contains("-") {
                 end.split_once("-").unwrap()
