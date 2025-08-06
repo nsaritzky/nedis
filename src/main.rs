@@ -517,10 +517,7 @@ async fn handle_xadd(
                 .split_once("-")
                 .expect(&format!("Invalid stream element id: {id}"));
 
-            let timestamp: u128 = timestamp.parse().expect("Invalid timestamp");
-            let sequence: usize = sequence.parse().expect("Invalid sequence number");
-
-            if timestamp == 0 && sequence == 0 {
+            if timestamp == "0" && sequence == "0" {
                 return send_response(
                     socket,
                     b"-ERR The ID specified in XADD must be greater than 0-0\r\n",
@@ -529,15 +526,39 @@ async fn handle_xadd(
             }
 
             let last_element = stream_vec.last();
-            if let Some(last_element) = last_element {
+
+            let id = if let Some(last_element) = last_element {
                 let (last_timestamp, last_sequence) = last_element.id.split_once("-").unwrap();
                 let last_timestamp: u128 = last_timestamp.parse().unwrap();
                 let last_sequence: usize = last_sequence.parse().unwrap();
 
-                if timestamp < last_timestamp || sequence <= last_sequence {
+                let timestamp: u128 = timestamp.parse().expect("Invalid timestamp");
+                let sequence: usize = if sequence == "*" {
+                    if timestamp > last_timestamp {
+                        0
+                    } else {
+                        last_sequence + 1
+                    }
+                } else {
+                    sequence.parse().expect("Invalid sequence number")
+                };
+
+                if timestamp < last_timestamp
+                    || (timestamp == last_timestamp && sequence <= last_sequence)
+                {
                     return send_response(socket, b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n").await;
                 }
-            }
+
+                format!("{timestamp}-{sequence}")
+            } else {
+                if timestamp == "0" {
+                    "0-1".to_string()
+                } else if sequence == "*" {
+                    format!("{timestamp}-0")
+                } else {
+                    format!("{timestamp}-{sequence}")
+                }
+            };
 
             let mut args: Vec<_> = v.drain(*i + 2..).collect();
 
