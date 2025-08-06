@@ -3,7 +3,7 @@ mod parser;
 mod redis_value;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -81,6 +81,9 @@ async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
                                 "LLEN" => {
                                     handle_llen(&db, &mut v, &mut i, &mut socket).await?;
                                 }
+                                "LPOP" => {
+                                    handle_lpop(&db, &mut v, &mut i, &mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -99,7 +102,7 @@ async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
 
 async fn handle_set(
     db: &Db,
-    v: &mut Vec<RedisValue>,
+    v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
@@ -142,7 +145,7 @@ async fn handle_set(
 
 async fn handle_get(
     db: &Db,
-    v: &mut Vec<RedisValue>,
+    v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
@@ -175,13 +178,13 @@ async fn handle_get(
 
 async fn handle_rpush(
     db: &Db,
-    v: &mut Vec<RedisValue>,
+    v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     let (key, mut values) = {
         let mut drain = v.drain(*i + 1..);
-        (drain.next(), drain.collect::<Vec<_>>())
+        (drain.next(), drain.collect::<VecDeque<_>>())
     };
 
     if let Some(RedisValue::Primitive(key)) = key {
@@ -209,12 +212,12 @@ async fn handle_rpush(
 
 async fn handle_lrange(
     db: &Db,
-    v: &mut Vec<RedisValue>,
+    v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     *i += 1;
-    let empty_array_response = &RedisValue::Arr(vec![]).to_bytes();
+    let empty_array_response = &RedisValue::Arr(VecDeque::new()).to_bytes();
 
     if let RedisValue::Primitive(key) = &v[*i] {
         let db = db.lock().await;
@@ -241,10 +244,10 @@ async fn handle_lrange(
                 if a >= array.len() {
                     send_response(socket, empty_array_response).await?;
                 } else if b > array.len() - 1 {
-                    let resp = RedisValue::Arr(array[a..].to_owned());
+                    let resp = RedisValue::Arr(array.range(a..).cloned().collect());
                     send_response(socket, &resp.to_bytes()).await?;
                 } else {
-                    let resp = RedisValue::Arr(array[a..=b].to_owned());
+                    let resp = RedisValue::Arr(array.range(a..=b).cloned().collect());
                     send_response(socket, &resp.to_bytes()).await?;
                 }
                 *i += 2;
@@ -263,13 +266,13 @@ async fn handle_lrange(
 
 async fn handle_lpush(
     db: &Db,
-    v: &mut Vec<RedisValue>,
+    v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     let (key, mut values) = {
         let mut drain = v.drain(*i + 1..);
-        (drain.next(), drain.rev().collect::<Vec<_>>())
+        (drain.next(), drain.rev().collect::<VecDeque<_>>())
     };
 
     if let Some(RedisValue::Primitive(key)) = key {
@@ -290,7 +293,7 @@ async fn handle_lpush(
 
 async fn handle_llen(
     db: &Db,
-    v: &mut Vec<RedisValue>,
+    v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
@@ -308,6 +311,33 @@ async fn handle_llen(
             let zero_resp = RedisValue::Primitive(PrimitiveRedisValue::Int(0));
 
             send_response(socket, &zero_resp.to_bytes()).await
+        }
+    } else {
+        bail!("Bad key: {:?}", v[*i]);
+    }
+}
+
+async fn handle_lpop(
+    db: &Db,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream
+) -> anyhow::Result<()> {
+    let empty_response = b"$-1\r\n";
+    *i += 1;
+
+    if let RedisValue::Primitive(key) = &v[*i] {
+        let mut db = db.lock().await;
+
+        if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(key) {
+            let resp = array.pop_front();
+            if let Some(resp) = resp {
+                send_response(socket, &resp.to_bytes()).await
+            } else {
+                send_response(socket, empty_response).await
+            }
+        } else {
+            send_response(socket, empty_response).await
         }
     } else {
         bail!("Bad key: {:?}", v[*i]);

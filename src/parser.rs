@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::{HashMap, VecDeque}, str::FromStr};
 
 use crate::redis_value::{PrimitiveRedisValue, RedisValue};
 use num::BigInt;
@@ -18,7 +18,7 @@ pub fn parse_value<'a>(input: &mut &'a [u8]) -> Result<RedisValue> {
             b'-' => parse_simple_string.map(|res| RedisValue::Primitive(PrimitiveRedisValue::Str(res))),
             b'$' => parse_bulk_string.map(|res| RedisValue::Primitive(PrimitiveRedisValue::Str(res))),
             b':' => dec_int.map(|res| RedisValue::Primitive(PrimitiveRedisValue::Int(res))),
-            b'*' => parse_array.map(RedisValue::Arr),
+            b'*' => parse_array.map(|arr| RedisValue::Arr(VecDeque::from(arr))),
             b'_' => parse_null,
             b'#' => parse_bool,
             b',' => parse_double,

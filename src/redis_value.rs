@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num::BigInt;
@@ -17,7 +17,7 @@ pub enum PrimitiveRedisValue {
 #[derive(Debug, Clone)]
 pub enum RedisValue {
     Primitive(PrimitiveRedisValue),
-    Arr(Vec<RedisValue>),
+    Arr(VecDeque<RedisValue>),
     Double(f64),
     Map(HashMap<PrimitiveRedisValue, RedisValue>),
     Attribute(HashMap<PrimitiveRedisValue, RedisValue>),
