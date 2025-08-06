@@ -586,20 +586,26 @@ async fn handle_xrange(
                     )
                 }
             };
-            let end = end.to_string().unwrap();
-            let (end_timestamp, end_sequence) = if end.contains("-") {
-                end.split_once("-").unwrap()
-            } else {
-                (end, "inf")
-            };
-            let (end_timestamp, end_sequence): (u128, usize) = (
-                end_timestamp.parse().unwrap(),
-                if end_sequence == "inf" {
-                    usize::MAX
+            let (end_timestamp, end_sequence): (u128, usize) = {
+                let end = end.to_string().unwrap();
+                if end == "+" {
+                    (u128::MAX, usize::MAX)
                 } else {
-                    end_sequence.parse().unwrap()
-                },
-            );
+                    let (end_timestamp, end_sequence) = if end.contains("-") {
+                        end.split_once("-").unwrap()
+                    } else {
+                        (end, "inf")
+                    };
+                    (
+                        end_timestamp.parse().unwrap(),
+                        if end_sequence == "inf" {
+                            usize::MAX
+                        } else {
+                            end_sequence.parse().unwrap()
+                        },
+                    )
+                }
+            };
 
             let mut result_vec: Vec<&StreamElement> = Vec::new();
 
