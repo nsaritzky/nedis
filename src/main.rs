@@ -390,8 +390,33 @@ async fn handle_blpop(
             }
         }
 
+        let expires =
+            if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(t))) = v.get(*i + 1) {
+                *i += 1;
+                if t == "0" {
+                    None
+                } else {
+                    let current_time = SystemTime::now();
+                    current_time.checked_add(Duration::from_secs_f64(t.parse().unwrap()))
+                }
+            } else {
+                None
+            };
+
         loop {
             interval.tick().await;
+
+            if let Some(expires) = expires {
+                if expires < SystemTime::now() {
+                    let mut blocks = blocks.lock().await;
+                    let blocks_set = blocks.get_mut(&key).expect("Blocks set should exist.");
+                    blocks_set.retain(|(_, id)| *id != task::id().to_string());
+                    if blocks_set.is_empty() {
+                        blocks.remove(&key);
+                    }
+                    return send_response(socket, b"$-1\r\n").await;
+                }
+            }
 
             if let Ok(mut db) = db.try_lock() {
                 if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
@@ -403,6 +428,10 @@ async fn handle_blpop(
 
                             if *id == task::id().to_string() {
                                 blocks_set.pop_first();
+
+                                if blocks_set.is_empty() {
+                                    blocks.remove(&key);
+                                }
 
                                 let resp_vec: VecDeque<_> =
                                     vec![RedisValue::Primitive(key.clone()), value].into();

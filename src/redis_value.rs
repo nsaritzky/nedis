@@ -9,6 +9,7 @@ pub enum PrimitiveRedisValue {
     Error(String),
     Int(isize),
     Null,
+    NilString,
     Bool(bool),
     BigInt(BigInt),
     Verbatim(Vec<u8>, Vec<u8>),
@@ -39,6 +40,9 @@ impl PrimitiveRedisValue {
             PrimitiveRedisValue::Null => {
                 buf.put_slice(b"_\r\n");
             },
+            PrimitiveRedisValue::NilString => {
+                buf.put_slice(b"$-1\r\n");
+            }
             PrimitiveRedisValue::Bool(val) => {
                 if *val {
                     buf.put_slice(b"#t\r\n");
