@@ -67,6 +67,9 @@ async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
                                 }
                                 "GET" => {
                                     handle_get(&db, &mut v, &mut i, &mut socket).await?;
+                                },
+                                "RPUSH" => {
+                                    handle_rpush(&db, &mut v, &mut i, &mut socket).await?;
                                 }
                                 _ => {}
                             }
@@ -158,6 +161,35 @@ async fn handle_get(
             String::from_utf8_lossy(&v[*i].to_bytes())
         );
     }
+}
+
+async fn handle_rpush(
+    db: &Db,
+    v: &mut Vec<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let (key, value) = {
+        let mut drain = v.drain(*i+1..*i+3);
+        (drain.next(), drain.next())
+    };
+
+    if let Some(RedisValue::Primitive(key)) = key {
+        let mut db = db.lock().await;
+
+        if let Some(value) = value {
+            db.insert(key, (RedisValue::Arr(vec![value]), None));
+
+            let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(1));
+            send_response(socket, &resp.to_bytes()).await?;
+            Ok(())
+        } else {
+            bail!("Unable to get value for list");
+        }
+    } else {
+        bail!("Invalid key type");
+    }
+
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
