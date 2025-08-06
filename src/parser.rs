@@ -50,7 +50,7 @@ fn parse_array<'a>(input: &mut &'a [u8]) -> Result<Vec<RedisValue>> {
     preceded(crlf, repeat(n, parse_value)).parse_next(input)
 }
 
-fn parse_null<'a>(input: &mut &'a [u8]) -> Result<RedisValue> {
+fn parse_null<'a>(_input: &mut &'a [u8]) -> Result<RedisValue> {
     Ok(RedisValue::Primitive(PrimitiveRedisValue::Null))
 }
 

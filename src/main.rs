@@ -170,32 +170,29 @@ async fn handle_rpush(
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
-    let (key, value) = {
-        let mut drain = v.drain(*i + 1..*i + 3);
-        (drain.next(), drain.next())
+    let (key, mut values) = {
+        let mut drain = v.drain(*i + 1..);
+        (drain.next(), drain.collect::<Vec<RedisValue>>())
     };
 
     if let Some(RedisValue::Primitive(key)) = key {
         let mut db = db.lock().await;
 
-        if let Some(value) = value {
-            if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
-                array.push(value);
+        if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
+            array.append(&mut values);
 
-                let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(
-                    array.len().to_isize().unwrap(),
-                ));
-                send_response(socket, &resp.to_bytes()).await?;
-            } else {
-                db.insert(key, (RedisValue::Arr(vec![value]), None));
-
-                let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(1));
-                send_response(socket, &resp.to_bytes()).await?;
-            }
-            Ok(())
+            let resp =
+                RedisValue::Primitive(PrimitiveRedisValue::Int(array.len().to_isize().unwrap()));
+            send_response(socket, &resp.to_bytes()).await?;
         } else {
-            bail!("Unable to get value for list");
+            let size = values.len().to_isize().unwrap();
+
+            db.insert(key, (RedisValue::Arr(values), None));
+
+            let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
+            send_response(socket, &resp.to_bytes()).await?;
         }
+        Ok(())
     } else {
         bail!("Invalid key type");
     }
