@@ -72,6 +72,9 @@ async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
                                 "RPUSH" => {
                                     handle_rpush(&db, &mut v, &mut i, &mut socket).await?;
                                 }
+                                "LRANGE" => {
+                                    handle_lrange(&db, &mut v, &mut i, &mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -195,6 +198,49 @@ async fn handle_rpush(
         Ok(())
     } else {
         bail!("Invalid key type");
+    }
+}
+
+async fn handle_lrange(
+    db: &Db,
+    v: &mut Vec<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    *i += 1;
+    let empty_array_response = &RedisValue::Arr(vec![]).to_bytes();
+
+    if let RedisValue::Primitive(key) = &v[*i] {
+        let db = db.lock().await;
+
+        if let Some((RedisValue::Arr(array), _)) = db.get(key) {
+            if let (
+                Some(RedisValue::Primitive(PrimitiveRedisValue::Str(a))),
+                Some(RedisValue::Primitive(PrimitiveRedisValue::Str(b))),
+            ) = (v.get(*i + 1), v.get(*i + 2))
+            {
+                let a: usize = a.parse()?;
+                let b: usize = b.parse()?;
+
+                if a >= array.len() {
+                    send_response(socket, empty_array_response).await?;
+                } else if b > array.len() - 1 {
+                    let resp = RedisValue::Arr(array[a..].to_owned());
+                    send_response(socket, &resp.to_bytes()).await?;
+                } else {
+                    let resp = RedisValue::Arr(array[a..=b].to_owned());
+                    send_response(socket, &resp.to_bytes()).await?;
+                }
+                Ok(())
+            } else {
+                bail!("Failed to get array bounds");
+            }
+        } else {
+            send_response(socket, empty_array_response).await?;
+            Ok(())
+        }
+    } else {
+        bail!("Failed to get list key");
     }
 }
 
