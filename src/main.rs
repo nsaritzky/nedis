@@ -11,6 +11,7 @@ use std::{
 use crate::parser::*;
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
+use num::ToPrimitive;
 use redis_value::{PrimitiveRedisValue, RedisValue};
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
@@ -67,7 +68,7 @@ async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
                                 }
                                 "GET" => {
                                     handle_get(&db, &mut v, &mut i, &mut socket).await?;
-                                },
+                                }
                                 "RPUSH" => {
                                     handle_rpush(&db, &mut v, &mut i, &mut socket).await?;
                                 }
@@ -119,7 +120,7 @@ async fn handle_set(
 
                         db.insert(k, (value, Some(expires)));
                     }
-                },
+                }
                 _ => {
                     db.insert(k, (value, None));
                 }
@@ -170,7 +171,7 @@ async fn handle_rpush(
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     let (key, value) = {
-        let mut drain = v.drain(*i+1..*i+3);
+        let mut drain = v.drain(*i + 1..*i + 3);
         (drain.next(), drain.next())
     };
 
@@ -178,10 +179,19 @@ async fn handle_rpush(
         let mut db = db.lock().await;
 
         if let Some(value) = value {
-            db.insert(key, (RedisValue::Arr(vec![value]), None));
+            if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
+                array.push(value);
 
-            let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(1));
-            send_response(socket, &resp.to_bytes()).await?;
+                let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(
+                    array.len().to_isize().unwrap(),
+                ));
+                send_response(socket, &resp.to_bytes()).await?;
+            } else {
+                db.insert(key, (RedisValue::Arr(vec![value]), None));
+
+                let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(1));
+                send_response(socket, &resp.to_bytes()).await?;
+            }
             Ok(())
         } else {
             bail!("Unable to get value for list");
@@ -189,7 +199,6 @@ async fn handle_rpush(
     } else {
         bail!("Invalid key type");
     }
-
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
