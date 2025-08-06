@@ -1,0 +1,116 @@
+use std::collections::HashMap;
+
+use bytes::{BufMut, Bytes, BytesMut};
+use num::BigInt;
+
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+pub enum PrimitiveRedisValue {
+    Str(String),
+    Error(String),
+    Int(isize),
+    Null,
+    Bool(bool),
+    BigInt(BigInt),
+    Verbatim(Vec<u8>, Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub enum RedisValue {
+    Primitive(PrimitiveRedisValue),
+    Arr(Vec<RedisValue>),
+    Double(f64),
+    Map(HashMap<PrimitiveRedisValue, RedisValue>),
+    Attribute(HashMap<PrimitiveRedisValue, RedisValue>),
+    Set(Vec<RedisValue>),
+    Push(Vec<RedisValue>),
+}
+
+impl PrimitiveRedisValue {
+    fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+
+        match self {
+            PrimitiveRedisValue::Str(s) | PrimitiveRedisValue::Error(s) => {
+                buf.put_slice(&bulk_string(s));
+            },
+            PrimitiveRedisValue::Int(n) => {
+                buf.put_slice(format!(":{n}\r\n").as_bytes());
+            },
+            PrimitiveRedisValue::Null => {
+                buf.put_slice(b"_\r\n");
+            },
+            PrimitiveRedisValue::Bool(val) => {
+                if *val {
+                    buf.put_slice(b"#t\r\n");
+                } else {
+                    buf.put_slice(b"#f\r\n");
+                }
+            },
+            PrimitiveRedisValue::BigInt(n) => {
+                buf.put_slice(format!("({n}\r\n").as_bytes());
+            },
+            PrimitiveRedisValue::Verbatim(encoding, data) => {
+                buf.put_slice(format!("={}\r\n", encoding.len() + data.len() + 1).as_bytes());
+                buf.put_slice(encoding);
+                buf.put_slice(b":");
+                buf.put_slice(data);
+                buf.put_slice(b"\r\n");
+            }
+        }
+
+        buf.freeze()
+    }
+}
+
+impl RedisValue {
+    pub fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+
+        match self {
+            RedisValue::Primitive(val) => {
+                buf.put_slice(&val.to_bytes());
+            },
+            RedisValue::Arr(vec) => {
+                buf.put_slice(format!("*{}\r\n", vec.len()).as_bytes());
+                for val in vec {
+                    buf.put_slice(&val.to_bytes());
+                }
+            },
+            RedisValue::Double(x) => {
+                buf.put_slice(format!(",{x}\r\n").as_bytes());
+            },
+            RedisValue::Map(map) => {
+                buf.put_slice(format!("%{}\r\n", map.len()).as_bytes());
+                for (key, val) in map.iter() {
+                    buf.put_slice(&key.to_bytes());
+                    buf.put_slice(&val.to_bytes());
+                }
+            },
+            RedisValue::Attribute(map) => {
+                buf.put_slice(format!("|{}\r\n", map.len()).as_bytes());
+                for (key, val) in map.iter() {
+                    buf.put_slice(&key.to_bytes());
+                    buf.put_slice(&val.to_bytes());
+                }
+            },
+            RedisValue::Set(vec) => {
+                buf.put_slice(format!("~{}\r\n", vec.len()).as_bytes());
+                for val in vec {
+                    buf.put_slice(&val.to_bytes());
+                }
+            },
+            RedisValue::Push(vec) => {
+                buf.put_slice(format!(">{}\r\n", vec.len()).as_bytes());
+                for val in vec {
+                    buf.put_slice(&val.to_bytes());
+                }
+            }
+        }
+
+        buf.freeze()
+    }
+}
+
+fn bulk_string<'a>(s: &'a str) -> Vec<u8> {
+    format!("${}\r\n{s}\r\n", s.len()).as_bytes().to_owned()
+}
