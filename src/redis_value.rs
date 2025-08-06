@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::{cmp::Ordering, collections::{HashMap, VecDeque}};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num::BigInt;
@@ -112,6 +112,41 @@ impl RedisValue {
         }
 
         buf.freeze()
+    }
+}
+
+pub struct StreamElement {
+    pub id: String,
+    pub value: HashMap<PrimitiveRedisValue, RedisValue>
+}
+
+impl StreamElement {
+    pub fn new(id: String, value: HashMap<PrimitiveRedisValue, RedisValue>) -> Self {
+        StreamElement{ id, value }
+    }
+}
+
+impl PartialEq for StreamElement {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for StreamElement {  }
+
+impl Ord for StreamElement {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.id == other.id {
+            panic!("Non-unique stream element ids");
+        } else {
+            self.id.cmp(&other.id)
+        }
+    }
+}
+
+impl PartialOrd for StreamElement {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 

@@ -3,7 +3,7 @@ mod parser;
 mod redis_value;
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{btree_map::Keys, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,8 +11,9 @@ use std::{
 use crate::parser::*;
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
+use itertools::Itertools;
 use num::ToPrimitive;
-use redis_value::{PrimitiveRedisValue, RedisValue};
+use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
 use tokio::task;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
@@ -23,6 +24,7 @@ use tokio::{
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
+type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<StreamElement>>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,22 +32,29 @@ async fn main() -> anyhow::Result<()> {
 
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
+    let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
 
         let db = Arc::clone(&db);
         let blocks = Arc::clone(&blocks);
+        let streams = Arc::clone(&streams);
 
         tokio::spawn(async move {
-            process(socket, db, blocks)
+            process(socket, db, blocks, streams)
                 .await
                 .expect("Process should be successful");
         });
     }
 }
 
-async fn process(mut socket: TcpStream, db: Db, blocks: Blocks) -> anyhow::Result<()> {
+async fn process(
+    mut socket: TcpStream,
+    db: Db,
+    blocks: Blocks,
+    streams: Streams,
+) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -93,7 +102,10 @@ async fn process(mut socket: TcpStream, db: Db, blocks: Blocks) -> anyhow::Resul
                                     handle_blpop(&db, &blocks, &mut v, &mut i, &mut socket).await?;
                                 }
                                 "TYPE" => {
-                                    handle_type(&db, &mut v, &mut i, &mut socket).await?;
+                                    handle_type(&db, &streams, &mut v, &mut i, &mut socket).await?;
+                                }
+                                "XADD" => {
+                                    handle_xadd(&streams, &mut v, &mut i, &mut socket).await?;
                                 }
                                 _ => {}
                             }
@@ -454,9 +466,10 @@ async fn handle_blpop(
 
 async fn handle_type(
     db: &Db,
+    streams: &Streams,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream
+    socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     *i += 1;
 
@@ -464,11 +477,62 @@ async fn handle_type(
         let db = db.lock().await;
 
         if db.get(key).is_some() {
-            return send_response(socket, b"+string\r\n").await
+            return send_response(socket, b"+string\r\n").await;
+        } else {
+            let streams = streams.lock().await;
+            if streams.get(key).is_some() {
+                return send_response(socket, b"+stream\r\n").await;
+            }
         }
         send_response(socket, b"+none\r\n").await
     } else {
         bail!("Bad key");
+    }
+}
+
+async fn handle_xadd(
+    streams: &Streams,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    *i += 1;
+
+    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
+        let mut streams = streams.lock().await;
+
+        let set = if let Some(set) = streams.get_mut(key) {
+            set
+        } else {
+            streams.insert(key.clone(), BTreeSet::new());
+            streams.get_mut(key).unwrap()
+        };
+
+        if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(id))) = v.get(*i + 1) {
+            *i += 1;
+
+            let id = id.clone();
+
+            let mut args: Vec<_> = v.drain(*i + 2..).collect();
+
+            let mut map = HashMap::new();
+
+            for (stream_key, value) in args.drain(..).tuples() {
+                if let RedisValue::Primitive(stream_key) = stream_key {
+                    map.insert(stream_key, value);
+                }
+            }
+
+            let result = StreamElement::new(id.clone(), map);
+            set.insert(result);
+
+            let resp = &RedisValue::Primitive(PrimitiveRedisValue::Str(id)).to_bytes();
+            send_response(socket, resp).await
+            } else {
+            bail!("Could not get id");
+        }
+    } else {
+        bail!("Could not extract key");
     }
 }
 
