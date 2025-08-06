@@ -92,6 +92,9 @@ async fn process(mut socket: TcpStream, db: Db, blocks: Blocks) -> anyhow::Resul
                                 "BLPOP" => {
                                     handle_blpop(&db, &blocks, &mut v, &mut i, &mut socket).await?;
                                 }
+                                "TYPE" => {
+                                    handle_type(&db, &mut v, &mut i, &mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -447,6 +450,26 @@ async fn handle_blpop(
         }
     }
     Ok(())
+}
+
+async fn handle_type(
+    db: &Db,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream
+) -> anyhow::Result<()> {
+    *i += 1;
+
+    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
+        let db = db.lock().await;
+
+        if db.get(key).is_some() {
+            return send_response(socket, b"+string\r\n").await
+        }
+        send_response(socket, b"+none\r\n").await
+    } else {
+        bail!("Bad key");
+    }
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
