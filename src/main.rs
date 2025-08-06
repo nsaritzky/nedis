@@ -2,10 +2,14 @@
 mod parser;
 mod redis_value;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::parser::*;
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use bytes::BytesMut;
 use redis_value::{PrimitiveRedisValue, RedisValue};
 use tokio::{
@@ -14,7 +18,7 @@ use tokio::{
     sync::Mutex,
 };
 
-type Db<'a> = Arc<Mutex<HashMap<PrimitiveRedisValue, RedisValue>>>;
+type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn process(mut socket: TcpStream, db: Db<'_>) -> anyhow::Result<()> {
+async fn process(mut socket: TcpStream, db: Db) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -59,27 +63,10 @@ async fn process(mut socket: TcpStream, db: Db<'_>) -> anyhow::Result<()> {
                                     }
                                 }
                                 "SET" => {
-                                    let mut iter = v.drain(i + 1..i + 3);
-                                    let key = iter.next();
-                                    let value = iter.next();
-                                    if let Some(RedisValue::Primitive(k)) = key {
-                                        if let Some(value) = value {
-                                            handle_set(k, value, &db).await?;
-                                            send_response(&mut socket, b"+OK\r\n").await?
-                                        }
-                                    }
+                                    handle_set(&db, &mut v, &mut i, &mut socket).await?;
                                 }
                                 "GET" => {
-                                    i += 1;
-                                    if let RedisValue::Primitive(key) = &v[i] {
-                                        let result = handle_get(key, &db).await;
-                                        if let Ok(value) = result
-                                        {
-                                            send_response(&mut socket, &value.to_bytes()).await?
-                                        } else if let Err(anyhow::Error { .. }) = result {
-                                            send_response(&mut socket, b"$-1\r\n").await?
-                                        }
-                                    }
+                                    handle_get(&db, &mut v, &mut i, &mut socket).await?;
                                 }
                                 _ => {}
                             }
@@ -97,19 +84,80 @@ async fn process(mut socket: TcpStream, db: Db<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_set<'a>(
-    key: PrimitiveRedisValue,
-    value: RedisValue,
-    db: &Db<'a>,
+async fn handle_set(
+    db: &Db,
+    v: &mut Vec<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
-    let mut db = db.lock().await;
-    db.insert(key, value);
+    let (key, value) = {
+        let mut iter = v.drain(*i + 1..*i + 3);
+        (iter.next(), iter.next())
+    };
+
+    if let Some(RedisValue::Primitive(k)) = key {
+        if let Some(value) = value {
+            let mut db = db.lock().await;
+
+            *i += 1;
+            match v.get(*i) {
+                Some(RedisValue::Primitive(PrimitiveRedisValue::Str(s)))
+                    if s.to_ascii_uppercase() == "PX" =>
+                {
+                    *i += 1;
+
+                    if let RedisValue::Primitive(PrimitiveRedisValue::Str(t)) = &v[*i] {
+                        let expires_in: u64 = t.parse()?;
+
+                        let current_time = SystemTime::now();
+                        let expires = current_time
+                            .checked_add(Duration::from_millis(expires_in))
+                            .ok_or(anyhow!("Invalid expires durartion"))?;
+
+                        db.insert(k, (value, Some(expires)));
+                    }
+                },
+                _ => {
+                    db.insert(k, (value, None));
+                }
+            }
+            send_response(socket, b"+OK\r\n").await?;
+        }
+    }
     Ok(())
 }
 
-async fn handle_get<'a>(key: &PrimitiveRedisValue, db: &Db<'a>) -> anyhow::Result<RedisValue> {
-    let db = db.lock().await;
-    db.get(key).ok_or(anyhow!("Key error")).cloned()
+async fn handle_get(
+    db: &Db,
+    v: &mut Vec<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    *i += 1;
+
+    if let RedisValue::Primitive(key) = &v[*i] {
+        let mut db = db.lock().await;
+
+        if let Some((value, expiry)) = db.get(key) {
+            if let Some(expiry) = expiry {
+                if *expiry < SystemTime::now() {
+                    db.remove(key);
+                    send_response(socket, b"$-1\r\n").await
+                } else {
+                    send_response(socket, &value.to_bytes()).await
+                }
+            } else {
+                send_response(socket, &value.to_bytes()).await
+            }
+        } else {
+            send_response(socket, b"$-1\r\n").await
+        }
+    } else {
+        bail!(
+            "Invalid key type: {}",
+            String::from_utf8_lossy(&v[*i].to_bytes())
+        );
+    }
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
