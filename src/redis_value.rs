@@ -113,8 +113,17 @@ impl RedisValue {
 
         buf.freeze()
     }
+
+    pub fn to_string(&self) -> Option<&str> {
+        if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = self {
+            Some(&s[..])
+        } else {
+            None
+        }
+    }
 }
 
+#[derive(Debug)]
 pub struct StreamElement {
     pub id: String,
     pub value: HashMap<PrimitiveRedisValue, RedisValue>

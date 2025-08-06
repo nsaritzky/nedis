@@ -108,6 +108,9 @@ async fn process(
                                 "XADD" => {
                                     handle_xadd(&streams, &mut v, &mut i, &mut socket).await?;
                                 }
+                                "XRANGE" => {
+                                    handle_xrange(&streams, &mut v, &mut i, &mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -528,7 +531,7 @@ async fn handle_xadd(
                 Err(e) => bail!(e),
             };
 
-            let mut args: Vec<_> = v.drain(*i + 2..).collect();
+            let mut args: Vec<_> = v.drain(*i + 1..).collect();
 
             let mut map = HashMap::new();
 
@@ -548,6 +551,97 @@ async fn handle_xadd(
         }
     } else {
         bail!("Could not extract key");
+    }
+}
+
+async fn handle_xrange(
+    streams: &Streams,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    *i += 1;
+
+    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
+        let streams = streams.lock().await;
+
+        if let Some(stream_vec) = streams.get(key) {
+            let mut drain = v.drain(*i+1..*i+3);
+            let start = drain.next().unwrap();
+            let end = drain.next().unwrap();
+
+            let start = start.to_string().unwrap();
+            let (start_timestamp, start_sequence) = if start.contains("-") {
+                start.split_once("-").unwrap()
+            } else {
+                (start, "0")
+            };
+            let (start_timestamp, start_sequence): (u128, usize) = (
+                start_timestamp.parse().unwrap(),
+                start_sequence.parse().unwrap(),
+            );
+            let end = end.to_string().unwrap();
+            let (end_timestamp, end_sequence) = if end.contains("-") {
+                end.split_once("-").unwrap()
+            } else {
+                (end, "inf")
+            };
+            let (end_timestamp, end_sequence): (u128, usize) = (
+                end_timestamp.parse().unwrap(),
+                if end_sequence == "inf" {
+                    usize::MAX
+                } else {
+                    end_sequence.parse().unwrap()
+                },
+            );
+
+            let mut result_vec: Vec<&StreamElement> = Vec::new();
+
+            for value in stream_vec {
+                let (timestamp, sequence) = value.id.split_once("-").unwrap();
+                let (timestamp, sequence): (u128, usize) =
+                    (timestamp.parse().unwrap(), sequence.parse().unwrap());
+
+                if timestamp > start_timestamp
+                    || (timestamp == start_timestamp && sequence >= start_sequence)
+                {
+                    if timestamp > end_timestamp
+                        || (timestamp == end_timestamp && sequence > end_sequence)
+                    {
+                        break;
+                    }
+                    result_vec.push(value);
+                }
+            }
+
+            let result_vec: VecDeque<_> = result_vec
+                .into_iter()
+                .map(|element| {
+                    RedisValue::Arr(
+                        vec![
+                            RedisValue::Primitive(PrimitiveRedisValue::Str(element.id.clone())),
+                            RedisValue::Arr(
+                                element
+                                    .value
+                                    .iter()
+                                    .flat_map(|(k, v)| {
+                                        [RedisValue::Primitive(k.clone()), v.clone()]
+                                    })
+                                    .collect(),
+                            ),
+                        ]
+                        .into(),
+                    )
+                })
+                .collect();
+
+            let resp = &RedisValue::Arr(result_vec).to_bytes();
+            send_response(socket, resp).await
+        } else {
+            send_response(socket, &RedisValue::Arr(VecDeque::new()).to_bytes()).await
+        }
+    } else {
+        bail!("Bad key");
     }
 }
 
@@ -638,7 +732,9 @@ fn generate_and_validate_stream_id(
                     0
                 }
             } else {
-                sequence.parse().map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?
+                sequence
+                    .parse()
+                    .map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?
             };
 
             Ok(format!("{timestamp}-{sequence}"))
