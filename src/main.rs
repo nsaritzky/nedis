@@ -29,6 +29,7 @@ type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum InstanceType {
     Master,
     Slave
@@ -898,7 +899,12 @@ fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
     match v[1].to_str().map(|s| s.to_ascii_lowercase()) {
         Some(s) if s == "replication" => {
             let instance_type = INSTANCE_TYPE.get().unwrap();
-            Ok(bulk_string(format!("role:{instance_type}").as_str()))
+            let mut lines = vec![format!("role:{instance_type}")];
+            if *instance_type == InstanceType::Master {
+                lines.push(format!("master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"));
+                lines.push(format!("master_repl_offset:0"));
+            }
+            Ok(bulk_string(lines.join("\r\n").as_str()))
         },
         _ => bail!(format!("INFO: Invalid argument {:?}", v[1]))
     }
