@@ -84,16 +84,8 @@ async fn main() -> anyhow::Result<()> {
         })
         .map_err(|_| anyhow!("Failed to set instance type"))?;
 
-    let global_config = GLOBAL_CONFIG.get().unwrap();
-
-    if global_config.instance_type == InstanceType::Slave {
-        let mut stream = TcpStream::connect(format!(
-            "{}:{}",
-            global_config.master_address.clone().unwrap(),
-            global_config.master_port.unwrap()
-        )).await?;
-
-        stream.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+    if is_replica {
+        send_handshake().await?;
     }
 
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
@@ -215,6 +207,46 @@ async fn execute_command(
         }
     } else {
         bail!("Invalid arg");
+    }
+}
+
+async fn send_handshake() -> anyhow::Result<()> {
+    let global_config = GLOBAL_CONFIG.get().unwrap();
+
+    let mut stream = TcpStream::connect(format!(
+        "{}:{}",
+        global_config.master_address.clone().unwrap(),
+        global_config.master_port.unwrap()
+    ))
+    .await?;
+
+    stream.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+    expect_response(&mut stream, b"+PONG\r\n").await?;
+    stream
+        .write_all(b"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n")
+        .await?;
+    expect_response(&mut stream, b"+OK\r\n").await?;
+    stream
+        .write_all(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
+        .await?;
+    expect_response(&mut stream, b"+OK\r\n").await?;
+
+    Ok(())
+}
+
+async fn expect_response(stream: &mut TcpStream, expected_response: &[u8]) -> anyhow::Result<()> {
+    let mut buf = BytesMut::with_capacity(expected_response.len());
+    buf.resize(expected_response.len(), 0);
+
+    stream.read_exact(&mut buf).await?;
+
+    if &buf == expected_response {
+        Ok(())
+    } else {
+        bail!(
+            "Did not receive expected response {}. Got {buf:?}, instead.",
+            String::from_utf8_lossy(expected_response)
+        )
     }
 }
 
