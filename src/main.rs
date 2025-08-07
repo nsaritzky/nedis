@@ -666,7 +666,87 @@ async fn handle_xread(
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
-    *i += 2;
+    *i += 1;
+
+    if let Some(arg) = v.get(*i) {
+        if arg
+            .to_str()
+            .is_some_and(|s| s.to_ascii_lowercase() == "block")
+        {
+            *i += 1;
+            let mut interval = interval(Duration::from_millis(10));
+
+            let timeout: u64 = v[*i]
+                .to_str()
+                .expect("Timeout arg should be a string")
+                .parse()
+                .expect("Timeout arg should be an unsigned int");
+
+            *i += 1;
+
+            let expires = SystemTime::now()
+                .checked_add(Duration::from_millis(timeout))
+                .unwrap();
+
+            loop {
+                interval.tick().await;
+
+                if expires < SystemTime::now() {
+                    return send_response(socket, b"$-1\r\n").await;
+                }
+
+                if let Ok(streams) = streams.try_lock() {
+                    let key = v[*i + 1]
+                        .to_primitive()
+                        .expect("Key should be a primitive redis value");
+                    let start = v[*i + 2].to_str().expect("Start id should be a string");
+
+                    let (start_timestamp, start_sequence): (u128, usize) = {
+                        let (start_timestamp, start_sequence) = start
+                            .split_once("-")
+                            .expect(&format!("Start id is invalid: {start}"));
+                        (
+                            start_timestamp.parse().unwrap(),
+                            start_sequence.parse().unwrap(),
+                        )
+                    };
+
+                    if let Some(stream_vec) = streams.get(key) {
+                        if let Some(last) = stream_vec.last() {
+                            let (timestamp, sequence) = parse_id(&last.id);
+                            if timestamp > start_timestamp
+                                || (timestamp == start_timestamp && sequence > start_sequence)
+                            {
+                                let mut j = 0usize;
+
+                                let (mut timestamp, mut sequence) = parse_id(&stream_vec[0].id);
+                                while timestamp < start_timestamp
+                                    || (timestamp == start_timestamp && sequence <= start_sequence)
+                                {
+                                    j += 1;
+
+                                    (timestamp, sequence) = parse_id(&stream_vec[j].id);
+                                }
+
+                                let result_vec = gather_stream_read_results(
+                                    stream_vec[j..].iter().collect(),
+                                    start,
+                                    key.clone(),
+                                );
+
+                                let resp_value =
+                                    RedisValue::Arr(vec![RedisValue::Arr(result_vec)].into());
+
+                                return send_response(socket, &resp_value.to_bytes()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    *i += 1;
 
     let streams = streams.lock().await;
 
@@ -771,7 +851,7 @@ fn gather_stream_read_results(
 }
 
 fn generate_and_validate_stream_id(
-    stream_vec: &Vec<StreamElement>,
+    stream_vec: &[StreamElement],
     id: &str,
 ) -> Result<String, StreamIdValidationError> {
     if let Some(last_element) = stream_vec.last() {
@@ -856,6 +936,15 @@ fn generate_and_validate_stream_id(
             Ok(format!("{timestamp}-{sequence}"))
         }
     }
+}
+
+fn parse_id(input: &str) -> (u128, usize) {
+    let (start_timestamp, start_sequence) =
+        input.split_once("-").expect("Start id is invalid: {start}");
+    (
+        start_timestamp.parse().unwrap(),
+        start_sequence.parse().unwrap(),
+    )
 }
 
 #[derive(Error, Debug)]
