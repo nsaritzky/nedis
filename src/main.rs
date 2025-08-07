@@ -668,74 +668,41 @@ async fn handle_xread(
 ) -> anyhow::Result<()> {
     *i += 2;
 
-    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
-        let streams = streams.lock().await;
+    let streams = streams.lock().await;
 
-        if let Some(stream_vec) = streams.get(key) {
-            let start = v[*i + 1].to_str().unwrap();
-            println!("Start: {start}");
+    let mut keys = Vec::new();
 
-            let (start_timestamp, start_sequence): (u128, usize) = {
-                let (start_timestamp, start_sequence) = start.split_once("-").unwrap();
-                (
-                    start_timestamp.parse().unwrap(),
-                    start_sequence.parse().unwrap(),
-                )
-            };
-
-            let mut results_vec = Vec::new();
-
-            for element in stream_vec {
-                let (timestamp, sequence): (u128, usize) = {
-                    let (timestamp, sequence) = element.id.split_once("-").unwrap();
-                    (timestamp.parse().unwrap(), sequence.parse().unwrap())
-                };
-
-                if timestamp > start_timestamp
-                    || (timestamp == start_timestamp && sequence > start_sequence)
-                {
-                    results_vec.push(element);
-                }
-            }
-
-            let response_vec: VecDeque<_> = vec![
-                RedisValue::Primitive(key.clone()),
-                RedisValue::Arr(
-                    results_vec
-                        .into_iter()
-                        .map(|element| {
-                            RedisValue::Arr(
-                                vec![
-                                    RedisValue::Primitive(PrimitiveRedisValue::Str(
-                                        element.id.clone(),
-                                    )),
-                                    RedisValue::Arr(
-                                        element
-                                            .value
-                                            .iter()
-                                            .flat_map(|(k, v)| {
-                                                [RedisValue::Primitive(k.clone()), v.clone()]
-                                            })
-                                            .collect(),
-                                    ),
-                                ]
-                                .into(),
-                            )
-                        })
-                        .collect(),
-                ),
-            ]
-            .into();
-
-            let resp = &RedisValue::Arr(vec![RedisValue::Arr(response_vec)].into()).to_bytes();
-
-            send_response(socket, resp).await
-        } else {
-            send_response(socket, &RedisValue::Arr(VecDeque::new()).to_bytes()).await
-        }
-    } else {
-        bail!("Bad key");
+    while v[*i]
+        .to_primitive()
+        .is_some_and(|key| streams.contains_key(key))
+    {
+        keys.push(v[*i].to_primitive().unwrap());
+        *i += 1;
     }
+
+    let starts: Vec<_> = v.range(*i..).map(|value| value.to_str().unwrap()).collect();
+
+    if keys.len() != starts.len() {
+        bail!(
+            "Provided {} keys but {} start values",
+            keys.len(),
+            starts.len()
+        );
+    }
+
+    let result_vec: VecDeque<_> = keys
+        .into_iter()
+        .zip(starts)
+        .map(|(k, start)| {
+            RedisValue::Arr(gather_stream_read_results(
+                streams.get(k).unwrap().iter().collect(),
+                start,
+                k.clone(),
+            ))
+        })
+        .collect();
+
+    send_response(socket, &RedisValue::Arr(result_vec).to_bytes()).await
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
@@ -745,6 +712,62 @@ async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()
 
 fn bulk_string<'a>(s: &'a str) -> Vec<u8> {
     format!("${}\r\n{s}\r\n", s.len()).as_bytes().to_owned()
+}
+
+fn gather_stream_read_results(
+    stream_vec: Vec<&StreamElement>,
+    start: &str,
+    key: PrimitiveRedisValue,
+) -> VecDeque<RedisValue> {
+    let (start_timestamp, start_sequence): (u128, usize) = {
+        let (start_timestamp, start_sequence) = start.split_once("-").unwrap();
+        (
+            start_timestamp.parse().unwrap(),
+            start_sequence.parse().unwrap(),
+        )
+    };
+
+    let mut results_vec = Vec::new();
+
+    for element in stream_vec {
+        let (timestamp, sequence): (u128, usize) = {
+            let (timestamp, sequence) = element.id.split_once("-").unwrap();
+            (timestamp.parse().unwrap(), sequence.parse().unwrap())
+        };
+
+        if timestamp > start_timestamp
+            || (timestamp == start_timestamp && sequence > start_sequence)
+        {
+            results_vec.push(element);
+        }
+    }
+
+    vec![
+        RedisValue::Primitive(key.clone()),
+        RedisValue::Arr(
+            results_vec
+                .into_iter()
+                .map(|element| {
+                    RedisValue::Arr(
+                        vec![
+                            RedisValue::Primitive(PrimitiveRedisValue::Str(element.id.clone())),
+                            RedisValue::Arr(
+                                element
+                                    .value
+                                    .iter()
+                                    .flat_map(|(k, v)| {
+                                        [RedisValue::Primitive(k.clone()), v.clone()]
+                                    })
+                                    .collect(),
+                            ),
+                        ]
+                        .into(),
+                    )
+                })
+                .collect(),
+        ),
+    ]
+    .into()
 }
 
 fn generate_and_validate_stream_id(

@@ -64,6 +64,14 @@ impl PrimitiveRedisValue {
 
         buf.freeze()
     }
+
+    pub fn to_str(&self) -> Option<&str> {
+        if let PrimitiveRedisValue::Str(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
 }
 
 impl RedisValue {
@@ -117,6 +125,14 @@ impl RedisValue {
     pub fn to_str(&self) -> Option<&str> {
         if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = self {
             Some(&s[..])
+        } else {
+            None
+        }
+    }
+
+    pub fn to_primitive(&self) -> Option<&PrimitiveRedisValue> {
+        if let RedisValue::Primitive(p) = self {
+            Some(p)
         } else {
             None
         }
