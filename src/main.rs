@@ -4,9 +4,7 @@ mod redis_value;
 mod args;
 
 use std::{
-    collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque},
-    sync::{Arc, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque}, fmt::{self, Display, Formatter}, sync::{Arc, OnceLock}, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use crate::parser::*;
@@ -34,6 +32,16 @@ type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
 enum InstanceType {
     Master,
     Slave
+}
+
+impl Display for InstanceType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let s = match self {
+            InstanceType::Master => "master",
+            InstanceType::Slave => "slave",
+        };
+        write!(f, "{s}")
+    }
 }
 
 static INSTANCE_TYPE: OnceLock<InstanceType> = OnceLock::new();
@@ -158,6 +166,7 @@ async fn execute_command(
             "XREAD" => handle_xread(&streams, v, &mut i).await,
             "INCR" => handle_incr(&db, v, &mut i).await,
             "MULTI" => handle_multi(transaction_active).await,
+            "INFO" => handle_info(v),
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
             _ => {
@@ -885,6 +894,16 @@ fn handle_discard(
     "+OK\r\n".into()
 }
 
+fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
+    match v[1].to_str().map(|s| s.to_ascii_lowercase()) {
+        Some(s) if s == "replication" => {
+            let instance_type = INSTANCE_TYPE.get().unwrap();
+            Ok(bulk_string(format!("role:{instance_type}").as_str()))
+        },
+        _ => bail!(format!("INFO: Invalid argument {:?}", v[1]))
+    }
+}
+
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
     socket.write_all(resp).await?;
     socket.flush().await.map_err(|e| anyhow!(e))
@@ -1025,6 +1044,10 @@ fn generate_and_validate_stream_id(
             Ok(format!("{timestamp}-{sequence}"))
         }
     }
+}
+
+fn bulk_string(s: &str) -> Bytes {
+    format!("${}\r\n{s}\r\n", s.len()).into()
 }
 
 fn parse_id(input: &str) -> (u128, usize) {
