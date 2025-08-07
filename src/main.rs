@@ -121,6 +121,9 @@ async fn process(
                                 "MULTI" => {
                                     handle_multi(&mut v, &mut i, &mut socket).await?;
                                 }
+                                "EXEC" => {
+                                    handle_exec(&mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -843,6 +846,10 @@ async fn handle_multi(
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
     send_response(socket, b"+OK\r\n").await
+}
+
+async fn handle_exec(socket: &mut TcpStream) -> anyhow::Result<()> {
+    send_response(socket, b"-ERR EXEC without MULTI\r\n").await
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
