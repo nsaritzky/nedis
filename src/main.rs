@@ -3,7 +3,7 @@ mod parser;
 mod redis_value;
 
 use std::{
-    collections::{btree_map::Keys, BTreeSet, HashMap, VecDeque},
+    collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -114,6 +114,9 @@ async fn process(
                                 }
                                 "XREAD" => {
                                     handle_xread(&streams, &mut v, &mut i, &mut socket).await?;
+                                }
+                                "INCR" => {
+                                    handle_incr(&db, &mut v, &mut i, &mut socket).await?;
                                 }
                                 _ => {}
                             }
@@ -791,6 +794,48 @@ async fn handle_xread(
     send_response(socket, &RedisValue::Arr(result_vec).to_bytes()).await
 }
 
+async fn handle_incr(
+    db: &Db,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    *i += 1;
+
+    let key = v[*i].to_primitive().unwrap();
+
+    let mut db = db.lock().await;
+
+    let updated_int = {
+       match db.entry(key.clone()) {
+           Entry::Occupied(mut occ) => {
+               let (old_val, expired) = occ.get();
+               if let Some(s) = old_val.to_str() {
+                   if let Ok(n) = s.parse::<isize>() {
+                       occ.insert(((n + 1).to_string().into(), *expired));
+                       Some(n + 1)
+                   } else {
+                       None
+                   }
+               } else {
+                   None
+               }
+           },
+           Entry::Vacant(vac) => {
+               vac.insert(("1".to_string().into(), None));
+               Some(1isize)
+           }
+       }
+    };
+
+    if let Some(n) = updated_int {
+        let resp_val: RedisValue = n.into();
+        send_response(socket, &resp_val.to_bytes()).await
+    } else {
+        Ok(())
+    }
+}
+
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
     socket.write_all(resp).await?;
     socket.flush().await.map_err(|e| anyhow!(e))
@@ -829,7 +874,7 @@ fn gather_stream_read_results(
                 .map(|element| {
                     RedisValue::Arr(
                         vec![
-                            RedisValue::Primitive(PrimitiveRedisValue::Str(element.id.clone())),
+                            element.id.clone().into(),
                             RedisValue::Arr(
                                 element
                                     .value

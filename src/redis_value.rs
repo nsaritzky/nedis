@@ -139,6 +139,24 @@ impl RedisValue {
     }
 }
 
+impl From<String> for RedisValue {
+    fn from(value: String) -> Self {
+        RedisValue::Primitive(PrimitiveRedisValue::Str(value))
+    }
+}
+
+impl From<PrimitiveRedisValue> for RedisValue {
+    fn from(value: PrimitiveRedisValue) -> Self {
+        RedisValue::Primitive(value)
+    }
+}
+
+impl From<isize> for RedisValue {
+    fn from(value: isize) -> Self {
+        RedisValue::Primitive(PrimitiveRedisValue::Int(value))
+    }
+}
+
 #[derive(Debug)]
 pub struct StreamElement {
     pub id: String,
