@@ -118,6 +118,9 @@ async fn process(
                                 "INCR" => {
                                     handle_incr(&db, &mut v, &mut i, &mut socket).await?;
                                 }
+                                "MULTI" => {
+                                    handle_multi(&mut v, &mut i, &mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -806,26 +809,24 @@ async fn handle_incr(
 
     let mut db = db.lock().await;
 
-    let updated_int = {
-       match db.entry(key.clone()) {
-           Entry::Occupied(mut occ) => {
-               let (old_val, expired) = occ.get();
-               if let Some(s) = old_val.to_str() {
-                   if let Ok(n) = s.parse::<isize>() {
-                       occ.insert(((n + 1).to_string().into(), *expired));
-                       Some(n + 1)
-                   } else {
-                       None
-                   }
-               } else {
-                   None
-               }
-           },
-           Entry::Vacant(vac) => {
-               vac.insert(("1".to_string().into(), None));
-               Some(1isize)
-           }
-       }
+    let updated_int = match db.entry(key.clone()) {
+        Entry::Occupied(mut occ) => {
+            let (old_val, expired) = occ.get();
+            if let Some(s) = old_val.to_str() {
+                if let Ok(n) = s.parse::<isize>() {
+                    occ.insert(((n + 1).to_string().into(), *expired));
+                    Some(n + 1)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        Entry::Vacant(vac) => {
+            vac.insert(("1".to_string().into(), None));
+            Some(1isize)
+        }
     };
 
     if let Some(n) = updated_int {
@@ -834,6 +835,14 @@ async fn handle_incr(
     } else {
         send_response(socket, b"-ERR value is not an integer or out of range\r\n").await
     }
+}
+
+async fn handle_multi(
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    send_response(socket, b"+OK\r\n").await
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
