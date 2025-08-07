@@ -81,8 +81,12 @@ async fn process(
                                 .await?;
                                 send_response(&mut socket, &resp).await?;
                             }
+                            Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
+                                let resp = handle_discard(&mut transaction_queue, &mut transaction_active);
+                                send_response(&mut socket, &resp).await?;
+                            }
                             _ => {
-                                let resp = queue_command(&mut transaction_queue, v).await?;
+                                let resp = queue_command(&mut transaction_queue, v)?;
                                 send_response(&mut socket, &resp).await?;
                             }
                         }
@@ -138,6 +142,7 @@ async fn execute_command(
             "INCR" => handle_incr(&db, v, &mut i).await,
             "MULTI" => handle_multi(transaction_active).await,
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
+            "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
             _ => {
                 bail!("Invalid command")
             }
@@ -846,12 +851,21 @@ async fn handle_exec(
     Ok(buf.freeze())
 }
 
-async fn queue_command(
+fn queue_command(
     transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
     args: VecDeque<RedisValue>,
 ) -> anyhow::Result<Bytes> {
     transaction_queue.push_back(args);
     Ok("+QUEUED\r\n".into())
+}
+
+fn handle_discard(
+    transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
+    transaction_active: &mut bool
+) -> Bytes {
+    transaction_queue.clear();
+    *transaction_active = false;
+    "+OK\r\n".into()
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
