@@ -201,6 +201,7 @@ async fn execute_command(
             "INFO" => handle_info(v),
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
+            "REPLCONF" => Ok("+OK\r\n".into()),
             _ => {
                 bail!("Invalid command")
             }
