@@ -1,16 +1,19 @@
 #![allow(unused_imports)]
 mod parser;
 mod redis_value;
+mod args;
 
 use std::{
     collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::parser::*;
+use crate::args::Args;
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
+use clap::Parser;
 use itertools::Itertools;
 use num::ToPrimitive;
 use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
@@ -28,9 +31,23 @@ type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
 
+enum InstanceType {
+    Master,
+    Slave
+}
+
+static INSTANCE_TYPE: OnceLock<InstanceType> = OnceLock::new();
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let args = Args::parse();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port)).await.unwrap();
+
+INSTANCE_TYPE.set(if args.replicaof.is_some() {
+        InstanceType::Slave
+    } else {
+        InstanceType::Master
+    }).map_err(|_| anyhow!("Failed to set instance type"))?;
 
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
@@ -86,7 +103,7 @@ async fn process(
                                 send_response(&mut socket, &resp).await?;
                             }
                             _ => {
-                                let resp = queue_command(&mut transaction_queue, v)?;
+                                let resp = queue_command(&mut transaction_queue, v);
                                 send_response(&mut socket, &resp).await?;
                             }
                         }
@@ -854,9 +871,9 @@ async fn handle_exec(
 fn queue_command(
     transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
     args: VecDeque<RedisValue>,
-) -> anyhow::Result<Bytes> {
+) -> Bytes {
     transaction_queue.push_back(args);
-    Ok("+QUEUED\r\n".into())
+    "+QUEUED\r\n".into()
 }
 
 fn handle_discard(
@@ -871,10 +888,6 @@ fn handle_discard(
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
     socket.write_all(resp).await?;
     socket.flush().await.map_err(|e| anyhow!(e))
-}
-
-fn bulk_string<'a>(s: &'a str) -> Vec<u8> {
-    format!("${}\r\n{s}\r\n", s.len()).as_bytes().to_owned()
 }
 
 fn gather_stream_read_results(
