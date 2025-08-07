@@ -27,7 +27,7 @@ use winnow::stream;
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
-type TransactionQueue = Arc<Mutex<(VecDeque<RedisValue>, bool)>>;
+type TransactionQueue = Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
-    let transaction_queue: TransactionQueue = Arc::new(Mutex::new((VecDeque::new(), false)));
+    let transaction_queue: TransactionQueue = Arc::new(Mutex::new(VecDeque::new()));
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -62,6 +62,7 @@ async fn process(
     transaction_queue: TransactionQueue,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
+    let mut transaction_active = false;
 
     loop {
         match socket.read_buf(&mut buf).await {
@@ -70,68 +71,26 @@ async fn process(
                 let results =
                     parse_value(&mut &buf[..n]).map_err(|e| anyhow!("Failed to parse: {e}"))?;
                 if let RedisValue::Arr(mut v) = results {
-                    let mut i = 0;
-                    while i < v.len() {
-                        if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = &v[i] {
-                            match s.to_ascii_uppercase().as_str() {
-                                "PING" => send_response(&mut socket, b"+PONG\r\n").await?,
-                                "ECHO" => {
-                                    i += 1;
-                                    if let RedisValue::Primitive(PrimitiveRedisValue::Str(resp)) =
-                                        &v[i]
-                                    {
-                                        send_response(&mut socket, &bulk_string(resp)).await?
-                                    }
-                                }
-                                "SET" => {
-                                    handle_set(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "GET" => {
-                                    handle_get(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "RPUSH" => {
-                                    handle_rpush(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "LRANGE" => {
-                                    handle_lrange(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "LPUSH" => {
-                                    handle_lpush(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "LLEN" => {
-                                    handle_llen(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "LPOP" => {
-                                    handle_lpop(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "BLPOP" => {
-                                    handle_blpop(&db, &blocks, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "TYPE" => {
-                                    handle_type(&db, &streams, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "XADD" => {
-                                    handle_xadd(&streams, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "XRANGE" => {
-                                    handle_xrange(&streams, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "XREAD" => {
-                                    handle_xread(&streams, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "INCR" => {
-                                    handle_incr(&db, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "MULTI" => {
-                                    handle_multi(&transaction_queue, &mut v, &mut i, &mut socket).await?;
-                                }
-                                "EXEC" => {
-                                    handle_exec(&transaction_queue, &mut socket).await?;
-                                }
-                                _ => {}
+                    if transaction_active {
+                        match v[0].to_str() {
+                            Some(s) if s.to_ascii_uppercase() == "EXEC" => {
+                                handle_exec(&transaction_queue, &mut transaction_active, &mut socket).await?;
                             }
-                            i += 1;
+                            _ => {
+                                queue_command(&transaction_queue, v, &mut socket).await?;
+                            }
                         }
+                    } else {
+                        execute_command(
+                            &mut v,
+                            &mut socket,
+                            &db,
+                            &blocks,
+                            &streams,
+                            &transaction_queue,
+                            &mut transaction_active,
+                        )
+                        .await?;
                     }
                 }
 
@@ -142,6 +101,51 @@ async fn process(
     }
 
     Ok(())
+}
+
+async fn execute_command(
+    v: &mut VecDeque<RedisValue>,
+    socket: &mut TcpStream,
+    db: &Db,
+    blocks: &Blocks,
+    streams: &Streams,
+    transaction_queue: &TransactionQueue,
+    transaction_active: &mut bool,
+) -> anyhow::Result<()> {
+    let mut i = 0;
+    if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = &v[i] {
+        match s.to_ascii_uppercase().as_str() {
+            "PING" => send_response(socket, b"+PONG\r\n").await,
+            "ECHO" => {
+                i += 1;
+                if let RedisValue::Primitive(PrimitiveRedisValue::Str(resp)) = &v[i] {
+                    send_response(socket, &bulk_string(resp)).await
+                } else {
+                    bail!("Invalid echo argument");
+                }
+            }
+            "SET" => handle_set(&db, v, &mut i, socket).await,
+            "GET" => handle_get(&db, v, &mut i, socket).await,
+            "RPUSH" => handle_rpush(&db, v, &mut i, socket).await,
+            "LRANGE" => handle_lrange(&db, v, &mut i, socket).await,
+            "LPUSH" => handle_lpush(&db, v, &mut i, socket).await,
+            "LLEN" => handle_llen(&db, v, &mut i, socket).await,
+            "LPOP" => handle_lpop(&db, v, &mut i, socket).await,
+            "BLPOP" => handle_blpop(&db, &blocks, v, &mut i, socket).await,
+            "TYPE" => handle_type(&db, &streams, v, &mut i, socket).await,
+            "XADD" => handle_xadd(&streams, v, &mut i, socket).await,
+            "XRANGE" => handle_xrange(&streams, v, &mut i, socket).await,
+            "XREAD" => handle_xread(&streams, v, &mut i, socket).await,
+            "INCR" => handle_incr(&db, v, &mut i, socket).await,
+            "MULTI" => handle_multi(transaction_active, socket).await,
+            "EXEC" => handle_exec(&transaction_queue, transaction_active, socket).await,
+            _ => {
+                bail!("Invalid command")
+            }
+        }
+    } else {
+        bail!("Invalid arg");
+    }
 }
 
 async fn handle_set(
@@ -844,25 +848,32 @@ async fn handle_incr(
     }
 }
 
-async fn handle_multi(
-    transaction_queue: &TransactionQueue,
-    v: &mut VecDeque<RedisValue>,
-    i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
-    let mut guard = transaction_queue.lock().await;
-    guard.1 = true;
+async fn handle_multi(transaction_active: &mut bool, socket: &mut TcpStream) -> anyhow::Result<()> {
+    *transaction_active = true;
     send_response(socket, b"+OK\r\n").await
 }
 
-async fn handle_exec(transaction_queue: &TransactionQueue, socket: &mut TcpStream) -> anyhow::Result<()> {
-    let mut guard = transaction_queue.lock().await;
-    if guard.1 {
-        guard.1 = false;
+async fn handle_exec(
+    transaction_queue: &TransactionQueue,
+    transaction_active: &mut bool,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    if *transaction_active {
+        *transaction_active = false;
         send_response(socket, b"*0\r\n").await
     } else {
         send_response(socket, b"-ERR EXEC without MULTI\r\n").await
     }
+}
+
+async fn queue_command(
+    transaction_queue: &TransactionQueue,
+    args: VecDeque<RedisValue>,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let mut transaction_queue = transaction_queue.lock().await;
+    transaction_queue.push_back(args);
+    send_response(socket, b"+QUEUED\r\n").await
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
