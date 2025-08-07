@@ -10,7 +10,7 @@ use std::{
 
 use crate::parser::*;
 use anyhow::{anyhow, bail};
-use bytes::BytesMut;
+use bytes::{BufMut, Bytes, BytesMut};
 use itertools::Itertools;
 use num::ToPrimitive;
 use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
@@ -27,7 +27,6 @@ use winnow::stream;
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
-type TransactionQueue = Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
-    let transaction_queue: TransactionQueue = Arc::new(Mutex::new(VecDeque::new()));
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -44,10 +42,9 @@ async fn main() -> anyhow::Result<()> {
         let db = Arc::clone(&db);
         let blocks = Arc::clone(&blocks);
         let streams = Arc::clone(&streams);
-        let transaction_queue = Arc::clone(&transaction_queue);
 
         tokio::spawn(async move {
-            process(socket, db, blocks, streams, transaction_queue)
+            process(socket, db, blocks, streams)
                 .await
                 .expect("Process should be successful");
         });
@@ -59,10 +56,10 @@ async fn process(
     db: Db,
     blocks: Blocks,
     streams: Streams,
-    transaction_queue: TransactionQueue,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut transaction_active = false;
+    let mut transaction_queue = VecDeque::<VecDeque<RedisValue>>::new();
 
     loop {
         match socket.read_buf(&mut buf).await {
@@ -74,23 +71,31 @@ async fn process(
                     if transaction_active {
                         match v[0].to_str() {
                             Some(s) if s.to_ascii_uppercase() == "EXEC" => {
-                                handle_exec(&transaction_queue, &mut transaction_active, &mut socket).await?;
+                                let resp = handle_exec(
+                                    &mut transaction_queue,
+                                    &db,
+                                    &blocks,
+                                    &streams,
+                                    &mut transaction_active,
+                                )
+                                .await?;
+                                send_response(&mut socket, &resp).await?;
                             }
                             _ => {
-                                queue_command(&transaction_queue, v, &mut socket).await?;
+                                let resp = queue_command(&mut transaction_queue, v).await?;
+                                send_response(&mut socket, &resp).await?;
                             }
                         }
                     } else {
-                        execute_command(
+                        let resp = execute_command(
                             &mut v,
-                            &mut socket,
                             &db,
                             &blocks,
                             &streams,
-                            &transaction_queue,
                             &mut transaction_active,
                         )
                         .await?;
+                        send_response(&mut socket, &resp).await?;
                     }
                 }
 
@@ -105,40 +110,34 @@ async fn process(
 
 async fn execute_command(
     v: &mut VecDeque<RedisValue>,
-    socket: &mut TcpStream,
     db: &Db,
     blocks: &Blocks,
     streams: &Streams,
-    transaction_queue: &TransactionQueue,
     transaction_active: &mut bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     let mut i = 0;
     if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = &v[i] {
         match s.to_ascii_uppercase().as_str() {
-            "PING" => send_response(socket, b"+PONG\r\n").await,
+            "PING" => Ok("+PONG\r\n".into()),
             "ECHO" => {
                 i += 1;
-                if let RedisValue::Primitive(PrimitiveRedisValue::Str(resp)) = &v[i] {
-                    send_response(socket, &bulk_string(resp)).await
-                } else {
-                    bail!("Invalid echo argument");
-                }
+                Ok(v[i].to_bytes())
             }
-            "SET" => handle_set(&db, v, &mut i, socket).await,
-            "GET" => handle_get(&db, v, &mut i, socket).await,
-            "RPUSH" => handle_rpush(&db, v, &mut i, socket).await,
-            "LRANGE" => handle_lrange(&db, v, &mut i, socket).await,
-            "LPUSH" => handle_lpush(&db, v, &mut i, socket).await,
-            "LLEN" => handle_llen(&db, v, &mut i, socket).await,
-            "LPOP" => handle_lpop(&db, v, &mut i, socket).await,
-            "BLPOP" => handle_blpop(&db, &blocks, v, &mut i, socket).await,
-            "TYPE" => handle_type(&db, &streams, v, &mut i, socket).await,
-            "XADD" => handle_xadd(&streams, v, &mut i, socket).await,
-            "XRANGE" => handle_xrange(&streams, v, &mut i, socket).await,
-            "XREAD" => handle_xread(&streams, v, &mut i, socket).await,
-            "INCR" => handle_incr(&db, v, &mut i, socket).await,
-            "MULTI" => handle_multi(transaction_active, socket).await,
-            "EXEC" => handle_exec(&transaction_queue, transaction_active, socket).await,
+            "SET" => handle_set(&db, v, &mut i).await,
+            "GET" => handle_get(&db, v, &mut i).await,
+            "RPUSH" => handle_rpush(&db, v, &mut i).await,
+            "LRANGE" => handle_lrange(&db, v, &mut i).await,
+            "LPUSH" => handle_lpush(&db, v, &mut i).await,
+            "LLEN" => handle_llen(&db, v, &mut i).await,
+            "LPOP" => handle_lpop(&db, v, &mut i).await,
+            "BLPOP" => handle_blpop(&db, &blocks, v, &mut i).await,
+            "TYPE" => handle_type(&db, &streams, v, &mut i).await,
+            "XADD" => handle_xadd(&streams, v, &mut i).await,
+            "XRANGE" => handle_xrange(&streams, v, &mut i).await,
+            "XREAD" => handle_xread(&streams, v, &mut i).await,
+            "INCR" => handle_incr(&db, v, &mut i).await,
+            "MULTI" => handle_multi(transaction_active).await,
+            "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             _ => {
                 bail!("Invalid command")
             }
@@ -148,12 +147,7 @@ async fn execute_command(
     }
 }
 
-async fn handle_set(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
-    i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+async fn handle_set(db: &Db, v: &mut VecDeque<RedisValue>, i: &mut usize) -> anyhow::Result<Bytes> {
     let (key, value) = {
         let mut iter = v.drain(*i + 1..*i + 3);
         (iter.next(), iter.next())
@@ -185,18 +179,16 @@ async fn handle_set(
                     db.insert(k, (value, None));
                 }
             }
-            send_response(socket, b"+OK\r\n").await?;
+            Ok("+OK\r\n".into())
+        } else {
+            bail!("SET: no value found")
         }
+    } else {
+        bail!("SET: bad key")
     }
-    Ok(())
 }
 
-async fn handle_get(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
-    i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+async fn handle_get(db: &Db, v: &mut VecDeque<RedisValue>, i: &mut usize) -> anyhow::Result<Bytes> {
     *i += 1;
 
     if let RedisValue::Primitive(key) = &v[*i] {
@@ -206,15 +198,15 @@ async fn handle_get(
             if let Some(expiry) = expiry {
                 if *expiry < SystemTime::now() {
                     db.remove(key);
-                    send_response(socket, b"$-1\r\n").await
+                    Ok("$-1\r\n".into())
                 } else {
-                    send_response(socket, &value.to_bytes()).await
+                    Ok(value.to_bytes())
                 }
             } else {
-                send_response(socket, &value.to_bytes()).await
+                Ok(value.to_bytes())
             }
         } else {
-            send_response(socket, b"$-1\r\n").await
+            Ok("$-1\r\n".into())
         }
     } else {
         bail!(
@@ -228,8 +220,7 @@ async fn handle_rpush(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     let (key, mut values) = {
         let mut drain = v.drain(*i + 1..);
         (drain.next(), drain.collect::<VecDeque<_>>())
@@ -243,16 +234,15 @@ async fn handle_rpush(
 
             let resp =
                 RedisValue::Primitive(PrimitiveRedisValue::Int(array.len().to_isize().unwrap()));
-            send_response(socket, &resp.to_bytes()).await?;
+            Ok(resp.to_bytes())
         } else {
             let size = values.len().to_isize().unwrap();
 
             db.insert(key, (RedisValue::Arr(values), None));
 
             let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
-            send_response(socket, &resp.to_bytes()).await?;
+            Ok(resp.to_bytes())
         }
-        Ok(())
     } else {
         bail!("Bad key: {key:?}");
     }
@@ -262,10 +252,9 @@ async fn handle_lrange(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
-    let empty_array_response = &RedisValue::Arr(VecDeque::new()).to_bytes();
+    let empty_array_response = RedisValue::Arr(VecDeque::new()).to_bytes();
 
     if let RedisValue::Primitive(key) = &v[*i] {
         let db = db.lock().await;
@@ -290,22 +279,19 @@ async fn handle_lrange(
                 };
 
                 if a >= array.len() {
-                    send_response(socket, empty_array_response).await?;
+                    Ok(empty_array_response)
                 } else if b > array.len() - 1 {
                     let resp = RedisValue::Arr(array.range(a..).cloned().collect());
-                    send_response(socket, &resp.to_bytes()).await?;
+                    Ok(resp.to_bytes())
                 } else {
                     let resp = RedisValue::Arr(array.range(a..=b).cloned().collect());
-                    send_response(socket, &resp.to_bytes()).await?;
+                    Ok(resp.to_bytes())
                 }
-                *i += 2;
-                Ok(())
             } else {
                 bail!("Failed to get array bounds");
             }
         } else {
-            send_response(socket, empty_array_response).await?;
-            Ok(())
+            Ok(empty_array_response)
         }
     } else {
         bail!("Failed to get list key");
@@ -316,8 +302,7 @@ async fn handle_lpush(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     let (key, mut values) = {
         let mut drain = v.drain(*i + 1..);
         (drain.next(), drain.rev().collect::<VecDeque<_>>())
@@ -333,7 +318,7 @@ async fn handle_lpush(
         db.insert(key, (RedisValue::Arr(values), None));
 
         let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
-        send_response(socket, &resp.to_bytes()).await
+        Ok(resp.to_bytes())
     } else {
         bail!("Bad key: {key:?}");
     }
@@ -343,8 +328,7 @@ async fn handle_llen(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
 
     if let RedisValue::Primitive(key) = &v[*i] {
@@ -354,11 +338,11 @@ async fn handle_llen(
             let size = array.len().to_isize().unwrap();
             let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
 
-            send_response(socket, &resp.to_bytes()).await
+            Ok(resp.to_bytes())
         } else {
             let zero_resp = RedisValue::Primitive(PrimitiveRedisValue::Int(0));
 
-            send_response(socket, &zero_resp.to_bytes()).await
+            Ok(zero_resp.to_bytes())
         }
     } else {
         bail!("Bad key: {:?}", v[*i]);
@@ -369,9 +353,8 @@ async fn handle_lpop(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
-    let empty_response = b"$-1\r\n";
+) -> anyhow::Result<Bytes> {
+    let empty_response = "$-1\r\n";
     *i += 1;
 
     if let RedisValue::Primitive(key) = &v[*i] {
@@ -385,22 +368,22 @@ async fn handle_lpop(
                 if n >= array.len() {
                     let resp_vec: VecDeque<_> = array.drain(..).collect();
 
-                    send_response(socket, &RedisValue::Arr(resp_vec).to_bytes()).await
+                    Ok(RedisValue::Arr(resp_vec).to_bytes())
                 } else {
                     let resp_vec: VecDeque<_> = array.drain(..n).collect();
 
-                    send_response(socket, &RedisValue::Arr(resp_vec).to_bytes()).await
+                    Ok(RedisValue::Arr(resp_vec).to_bytes())
                 }
             } else {
                 let resp = array.pop_front();
                 if let Some(resp) = resp {
-                    send_response(socket, &resp.to_bytes()).await
+                    Ok(resp.to_bytes())
                 } else {
-                    send_response(socket, empty_response).await
+                    Ok(empty_response.into())
                 }
             }
         } else {
-            send_response(socket, empty_response).await
+            Ok(empty_response.into())
         }
     } else {
         bail!("Bad key: {:?}", v[*i]);
@@ -412,8 +395,7 @@ async fn handle_blpop(
     blocks: &Blocks,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     let mut interval = interval(Duration::from_millis(10));
     *i += 1;
 
@@ -454,7 +436,7 @@ async fn handle_blpop(
                     if blocks_set.is_empty() {
                         blocks.remove(&key);
                     }
-                    return send_response(socket, b"$-1\r\n").await;
+                    return Ok("$-1\r\n".into());
                 }
             }
 
@@ -476,17 +458,18 @@ async fn handle_blpop(
                                 let resp_vec: VecDeque<_> =
                                     vec![RedisValue::Primitive(key.clone()), value].into();
 
-                                let resp = &RedisValue::Arr(resp_vec).to_bytes();
+                                let resp = RedisValue::Arr(resp_vec).to_bytes();
 
-                                return send_response(socket, resp).await;
+                                return Ok(resp);
                             }
                         }
                     }
                 }
             }
         }
+    } else {
+        bail!("BLPOP: Invalid key")
     }
-    Ok(())
 }
 
 async fn handle_type(
@@ -494,22 +477,21 @@ async fn handle_type(
     streams: &Streams,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
 
     if let Some(RedisValue::Primitive(key)) = v.get(*i) {
         let db = db.lock().await;
 
         if db.get(key).is_some() {
-            return send_response(socket, b"+string\r\n").await;
+            return Ok("+string\r\n".into());
         } else {
             let streams = streams.lock().await;
             if streams.get(key).is_some() {
-                return send_response(socket, b"+stream\r\n").await;
+                return Ok("+stream\r\n".into());
             }
         }
-        send_response(socket, b"+none\r\n").await
+        Ok("+none\r\n".into())
     } else {
         bail!("Bad key");
     }
@@ -519,8 +501,7 @@ async fn handle_xadd(
     streams: &Streams,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
 
     if let Some(RedisValue::Primitive(key)) = v.get(*i) {
@@ -539,15 +520,11 @@ async fn handle_xadd(
             let id = match generate_and_validate_stream_id(stream_vec, id) {
                 Ok(id) => id,
                 Err(StreamIdValidationError::Zero) => {
-                    return send_response(
-                        socket,
-                        b"-ERR The ID specified in XADD must be greater than 0-0\r\n",
-                    )
-                    .await;
+                    return Ok("-ERR The ID specified in XADD must be greater than 0-0\r\n".into())
                 }
                 Err(StreamIdValidationError::DecreasingTimestamp)
                 | Err(StreamIdValidationError::NonincreasingSequence) => {
-                    return send_response(socket, b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n").await;
+                    return Ok("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".into());
                 }
                 Err(e) => bail!(e),
             };
@@ -565,8 +542,7 @@ async fn handle_xadd(
             let result = StreamElement::new(id.clone(), map);
             stream_vec.push(result);
 
-            let resp = &RedisValue::Primitive(PrimitiveRedisValue::Str(id)).to_bytes();
-            send_response(socket, resp).await
+            Ok(RedisValue::Primitive(PrimitiveRedisValue::Str(id)).to_bytes())
         } else {
             bail!("Could not get id");
         }
@@ -579,8 +555,7 @@ async fn handle_xrange(
     streams: &Streams,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
 
     if let Some(RedisValue::Primitive(key)) = v.get(*i) {
@@ -668,10 +643,9 @@ async fn handle_xrange(
                 })
                 .collect();
 
-            let resp = &RedisValue::Arr(result_vec).to_bytes();
-            send_response(socket, resp).await
+            Ok(RedisValue::Arr(result_vec).to_bytes())
         } else {
-            send_response(socket, &RedisValue::Arr(VecDeque::new()).to_bytes()).await
+            Ok(RedisValue::Arr(VecDeque::new()).to_bytes())
         }
     } else {
         bail!("Bad key");
@@ -682,8 +656,7 @@ async fn handle_xread(
     streams: &Streams,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
 
     if let Some(arg) = v.get(*i) {
@@ -727,7 +700,7 @@ async fn handle_xread(
                 interval.tick().await;
 
                 if expires.is_some_and(|exp| exp < SystemTime::now()) {
-                    return send_response(socket, b"$-1\r\n").await;
+                    return Ok("$-1\r\n".into());
                 }
 
                 if let Ok(streams) = streams.try_lock() {
@@ -758,7 +731,7 @@ async fn handle_xread(
                                 let resp_value =
                                     RedisValue::Arr(vec![RedisValue::Arr(result_vec)].into());
 
-                                return send_response(socket, &resp_value.to_bytes()).await;
+                                return Ok(resp_value.to_bytes());
                             }
                         }
                     }
@@ -805,15 +778,14 @@ async fn handle_xread(
         })
         .collect();
 
-    send_response(socket, &RedisValue::Arr(result_vec).to_bytes()).await
+    Ok(RedisValue::Arr(result_vec).to_bytes())
 }
 
 async fn handle_incr(
     db: &Db,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     *i += 1;
 
     let key = v[*i].to_primitive().unwrap();
@@ -842,38 +814,44 @@ async fn handle_incr(
 
     if let Some(n) = updated_int {
         let resp_val: RedisValue = n.into();
-        send_response(socket, &resp_val.to_bytes()).await
+        Ok(resp_val.to_bytes())
     } else {
-        send_response(socket, b"-ERR value is not an integer or out of range\r\n").await
+        Ok("-ERR value is not an integer or out of range\r\n".into())
     }
 }
 
-async fn handle_multi(transaction_active: &mut bool, socket: &mut TcpStream) -> anyhow::Result<()> {
+async fn handle_multi(transaction_active: &mut bool) -> anyhow::Result<Bytes> {
     *transaction_active = true;
-    send_response(socket, b"+OK\r\n").await
+    Ok("+OK\r\n".into())
 }
 
 async fn handle_exec(
-    transaction_queue: &TransactionQueue,
+    transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
+    db: &Db,
+    blocks: &Blocks,
+    streams: &Streams,
     transaction_active: &mut bool,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
-    if *transaction_active {
-        *transaction_active = false;
-        send_response(socket, b"*0\r\n").await
-    } else {
-        send_response(socket, b"-ERR EXEC without MULTI\r\n").await
+) -> anyhow::Result<Bytes> {
+    let mut buf = BytesMut::new();
+
+    buf.put_slice(format!("*{}\r\n", transaction_queue.len()).as_bytes());
+
+    for args in transaction_queue {
+        let resp = execute_command(args, db, blocks, streams, transaction_active).await?;
+        buf.put_slice(&resp);
     }
+
+    *transaction_active = false;
+
+    Ok(buf.freeze())
 }
 
 async fn queue_command(
-    transaction_queue: &TransactionQueue,
+    transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
     args: VecDeque<RedisValue>,
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
-    let mut transaction_queue = transaction_queue.lock().await;
+) -> anyhow::Result<Bytes> {
     transaction_queue.push_back(args);
-    send_response(socket, b"+QUEUED\r\n").await
+    Ok("+QUEUED\r\n".into())
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
