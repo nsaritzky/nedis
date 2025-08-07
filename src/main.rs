@@ -22,6 +22,7 @@ use tokio::{
     sync::Mutex,
     time::interval,
 };
+use winnow::stream;
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
@@ -685,11 +686,24 @@ async fn handle_xread(
             *i += 1;
 
             let expires = if timeout > 0 {
-                Some(SystemTime::now()
-                    .checked_add(Duration::from_millis(timeout))
-                    .unwrap())
+                Some(
+                    SystemTime::now()
+                        .checked_add(Duration::from_millis(timeout))
+                        .unwrap(),
+                )
             } else {
                 None
+            };
+
+            let key = v[*i + 1]
+                .to_primitive()
+                .expect("Key should be a primitive redis value");
+
+            let start = v[*i + 2].to_str().expect("Start id should be a string");
+
+            let (start_timestamp, start_sequence) = {
+                let streams = streams.lock().await;
+                parse_id_with_dollar_sign(start, streams.get(key).unwrap_or(&vec![]))
             };
 
             loop {
@@ -700,21 +714,6 @@ async fn handle_xread(
                 }
 
                 if let Ok(streams) = streams.try_lock() {
-                    let key = v[*i + 1]
-                        .to_primitive()
-                        .expect("Key should be a primitive redis value");
-                    let start = v[*i + 2].to_str().expect("Start id should be a string");
-
-                    let (start_timestamp, start_sequence): (u128, usize) = {
-                        let (start_timestamp, start_sequence) = start
-                            .split_once("-")
-                            .expect(&format!("Start id is invalid: {start}"));
-                        (
-                            start_timestamp.parse().unwrap(),
-                            start_sequence.parse().unwrap(),
-                        )
-                    };
-
                     if let Some(stream_vec) = streams.get(key) {
                         if let Some(last) = stream_vec.last() {
                             let (timestamp, sequence) = parse_id(&last.id);
@@ -734,7 +733,8 @@ async fn handle_xread(
 
                                 let result_vec = gather_stream_read_results(
                                     stream_vec[j..].iter().collect(),
-                                    start,
+                                    start_timestamp,
+                                    start_sequence,
                                     key.clone(),
                                 );
 
@@ -778,9 +778,11 @@ async fn handle_xread(
         .into_iter()
         .zip(starts)
         .map(|(k, start)| {
+            let (start_timestamp, start_sequence) = parse_id(start);
             RedisValue::Arr(gather_stream_read_results(
                 streams.get(k).unwrap().iter().collect(),
-                start,
+                start_timestamp,
+                start_sequence,
                 k.clone(),
             ))
         })
@@ -800,17 +802,10 @@ fn bulk_string<'a>(s: &'a str) -> Vec<u8> {
 
 fn gather_stream_read_results(
     stream_vec: Vec<&StreamElement>,
-    start: &str,
+    start_timestamp: u128,
+    start_sequence: usize,
     key: PrimitiveRedisValue,
 ) -> VecDeque<RedisValue> {
-    let (start_timestamp, start_sequence): (u128, usize) = {
-        let (start_timestamp, start_sequence) = start.split_once("-").unwrap();
-        (
-            start_timestamp.parse().unwrap(),
-            start_sequence.parse().unwrap(),
-        )
-    };
-
     let mut results_vec = Vec::new();
 
     for element in stream_vec {
@@ -943,8 +938,26 @@ fn generate_and_validate_stream_id(
 }
 
 fn parse_id(input: &str) -> (u128, usize) {
-    let (start_timestamp, start_sequence) =
-        input.split_once("-").expect("Start id is invalid: {start}");
+    let (start_timestamp, start_sequence) = input
+        .split_once("-")
+        .expect(&format!("Start id is invalid: {input}"));
+    (
+        start_timestamp.parse().unwrap(),
+        start_sequence.parse().unwrap(),
+    )
+}
+
+fn parse_id_with_dollar_sign(input: &str, stream_vec: &Vec<StreamElement>) -> (u128, usize) {
+    let (start_timestamp, start_sequence) = if input == "$" {
+        stream_vec
+            .last()
+            .map(|entry| entry.id.split_once("-").unwrap())
+            .unwrap_or(("0", "0"))
+    } else {
+        input
+            .split_once("-")
+            .expect(&format!("Start id is invalid: {input}"))
+    };
     (
         start_timestamp.parse().unwrap(),
         start_sequence.parse().unwrap(),
