@@ -832,7 +832,7 @@ async fn handle_incr(
         let resp_val: RedisValue = n.into();
         send_response(socket, &resp_val.to_bytes()).await
     } else {
-        Ok(())
+        send_response(socket, b"-ERR value is not an integer or out of range\r\n").await
     }
 }
 
