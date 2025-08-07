@@ -684,14 +684,18 @@ async fn handle_xread(
 
             *i += 1;
 
-            let expires = SystemTime::now()
-                .checked_add(Duration::from_millis(timeout))
-                .unwrap();
+            let expires = if timeout > 0 {
+                Some(SystemTime::now()
+                    .checked_add(Duration::from_millis(timeout))
+                    .unwrap())
+            } else {
+                None
+            };
 
             loop {
                 interval.tick().await;
 
-                if expires < SystemTime::now() {
+                if expires.is_some_and(|exp| exp < SystemTime::now()) {
                     return send_response(socket, b"$-1\r\n").await;
                 }
 
