@@ -111,6 +111,9 @@ async fn process(
                                 "XRANGE" => {
                                     handle_xrange(&streams, &mut v, &mut i, &mut socket).await?;
                                 }
+                                "XREAD" => {
+                                    handle_xread(&streams, &mut v, &mut i, &mut socket).await?;
+                                }
                                 _ => {}
                             }
                             i += 1;
@@ -571,7 +574,7 @@ async fn handle_xrange(
             let end = drain.next().unwrap();
 
             let (start_timestamp, start_sequence): (u128, usize) = {
-                let start = start.to_string().unwrap();
+                let start = start.to_str().unwrap();
                 if start == "-" {
                     (0, 0)
                 } else {
@@ -587,7 +590,7 @@ async fn handle_xrange(
                 }
             };
             let (end_timestamp, end_sequence): (u128, usize) = {
-                let end = end.to_string().unwrap();
+                let end = end.to_str().unwrap();
                 if end == "+" {
                     (u128::MAX, usize::MAX)
                 } else {
@@ -648,6 +651,84 @@ async fn handle_xrange(
                 .collect();
 
             let resp = &RedisValue::Arr(result_vec).to_bytes();
+            send_response(socket, resp).await
+        } else {
+            send_response(socket, &RedisValue::Arr(VecDeque::new()).to_bytes()).await
+        }
+    } else {
+        bail!("Bad key");
+    }
+}
+
+async fn handle_xread(
+    streams: &Streams,
+    v: &mut VecDeque<RedisValue>,
+    i: &mut usize,
+    socket: &mut TcpStream,
+) -> anyhow::Result<()> {
+    *i += 2;
+
+    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
+        let streams = streams.lock().await;
+
+        if let Some(stream_vec) = streams.get(key) {
+            let start = v[*i + 1].to_str().unwrap();
+            println!("Start: {start}");
+
+            let (start_timestamp, start_sequence): (u128, usize) = {
+                let (start_timestamp, start_sequence) = start.split_once("-").unwrap();
+                (
+                    start_timestamp.parse().unwrap(),
+                    start_sequence.parse().unwrap(),
+                )
+            };
+
+            let mut results_vec = Vec::new();
+
+            for element in stream_vec {
+                let (timestamp, sequence): (u128, usize) = {
+                    let (timestamp, sequence) = element.id.split_once("-").unwrap();
+                    (timestamp.parse().unwrap(), sequence.parse().unwrap())
+                };
+
+                if timestamp > start_timestamp
+                    || (timestamp == start_timestamp && sequence > start_sequence)
+                {
+                    results_vec.push(element);
+                }
+            }
+
+            let response_vec: VecDeque<_> = vec![
+                RedisValue::Primitive(key.clone()),
+                RedisValue::Arr(
+                    results_vec
+                        .into_iter()
+                        .map(|element| {
+                            RedisValue::Arr(
+                                vec![
+                                    RedisValue::Primitive(PrimitiveRedisValue::Str(
+                                        element.id.clone(),
+                                    )),
+                                    RedisValue::Arr(
+                                        element
+                                            .value
+                                            .iter()
+                                            .flat_map(|(k, v)| {
+                                                [RedisValue::Primitive(k.clone()), v.clone()]
+                                            })
+                                            .collect(),
+                                    ),
+                                ]
+                                .into(),
+                            )
+                        })
+                        .collect(),
+                ),
+            ]
+            .into();
+
+            let resp = &RedisValue::Arr(vec![RedisValue::Arr(response_vec)].into()).to_bytes();
+
             send_response(socket, resp).await
         } else {
             send_response(socket, &RedisValue::Arr(VecDeque::new()).to_bytes()).await

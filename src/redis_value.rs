@@ -114,7 +114,7 @@ impl RedisValue {
         buf.freeze()
     }
 
-    pub fn to_string(&self) -> Option<&str> {
+    pub fn to_str(&self) -> Option<&str> {
         if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = self {
             Some(&s[..])
         } else {
