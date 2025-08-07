@@ -1,16 +1,17 @@
-#![allow(unused_imports)]
 mod args;
+mod hex;
 mod parser;
 mod redis_value;
 
 use std::{
-    collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque},
+    collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     fmt::{self, Display, Formatter},
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::args::Args;
+use crate::hex::parse_hex_string;
 use crate::parser::*;
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -21,12 +22,13 @@ use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
 use thiserror::Error;
 use tokio::task;
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
     time::interval,
 };
-use winnow::stream;
+
+const EMPTY_RDB_FILE: &str = include_str!("../resources/empty_rdb.hex");
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
@@ -52,18 +54,18 @@ impl Display for InstanceType {
 struct GlobalConfig {
     instance_type: InstanceType,
     master_config: Option<MasterConfig>,
-    slave_config: Option<SlaveConfig>
+    slave_config: Option<SlaveConfig>,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
 struct SlaveConfig {
     master_address: String,
-    master_port: usize
+    master_port: usize,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
 struct MasterConfig {
-    replication_id: String
+    replication_id: String,
 }
 
 static GLOBAL_CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
@@ -81,23 +83,23 @@ async fn main() -> anyhow::Result<()> {
         .set(if args.replicaof.is_some() {
             let replicaof = args.replicaof.unwrap();
             let (addr, port) = replicaof.split_once(" ").expect("Invalid replicaof");
-            let slave_config = Some(SlaveConfig{
+            let slave_config = Some(SlaveConfig {
                 master_address: addr.to_string(),
-                master_port: port.parse().expect("Invalid master port")
+                master_port: port.parse().expect("Invalid master port"),
             });
             GlobalConfig {
                 instance_type: InstanceType::Slave,
                 slave_config,
-                master_config: None
+                master_config: None,
             }
         } else {
-            let master_config = Some(MasterConfig{
-                replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string()
+            let master_config = Some(MasterConfig {
+                replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
             });
             GlobalConfig {
                 instance_type: InstanceType::Master,
                 slave_config: None,
-                master_config
+                master_config,
             }
         })
         .map_err(|_| anyhow!("Failed to set instance type"))?;
@@ -165,6 +167,18 @@ async fn process(
                                 send_response(&mut socket, &resp).await?;
                             }
                         }
+                        // PSYNC sends two responses, so it needs special handling
+                    } else if v[0].to_str().map(|s| s.to_ascii_uppercase())
+                        == Some("PSYNC".to_string())
+                    {
+                        let resp = handle_psync()?;
+                        send_response(&mut socket, &resp).await?;
+
+                        let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
+                        let mut empty_rdb_resp = BytesMut::new();
+                        empty_rdb_resp.extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
+                        empty_rdb_resp.extend_from_slice(&empty_rdb_file);
+                        send_response(&mut socket, &empty_rdb_resp).await?;
                     } else {
                         let resp = execute_command(
                             &mut v,
@@ -1009,7 +1023,10 @@ fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
 
 fn handle_psync() -> anyhow::Result<Bytes> {
     let global_config = GLOBAL_CONFIG.get().unwrap();
-    let master_config = global_config.master_config.clone().ok_or(anyhow!("Called PSYNC on a replica"))?;
+    let master_config = global_config
+        .master_config
+        .clone()
+        .ok_or(anyhow!("Called PSYNC on a replica"))?;
 
     Ok(format!("+FULLRESYNC {} 0\r\n", master_config.replication_id).into())
 }
