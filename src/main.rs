@@ -1,14 +1,17 @@
 #![allow(unused_imports)]
+mod args;
 mod parser;
 mod redis_value;
-mod args;
 
 use std::{
-    collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque}, fmt::{self, Display, Formatter}, sync::{Arc, OnceLock}, time::{Duration, SystemTime, UNIX_EPOCH}
+    collections::{btree_map::Keys, hash_map::Entry, BTreeSet, HashMap, VecDeque},
+    fmt::{self, Display, Formatter},
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::parser::*;
 use crate::args::Args;
+use crate::parser::*;
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
@@ -29,10 +32,10 @@ type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum InstanceType {
     Master,
-    Slave
+    Slave,
 }
 
 impl Display for InstanceType {
@@ -45,18 +48,53 @@ impl Display for InstanceType {
     }
 }
 
-static INSTANCE_TYPE: OnceLock<InstanceType> = OnceLock::new();
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct GlobalConfig {
+    instance_type: InstanceType,
+    master_address: Option<String>,
+    master_port: Option<usize>,
+}
+
+static GLOBAL_CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port)).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port))
+        .await
+        .unwrap();
 
-INSTANCE_TYPE.set(if args.replicaof.is_some() {
-        InstanceType::Slave
-    } else {
-        InstanceType::Master
-    }).map_err(|_| anyhow!("Failed to set instance type"))?;
+    let is_replica = args.replicaof.is_some();
+
+    GLOBAL_CONFIG
+        .set(if args.replicaof.is_some() {
+            let replicaof = args.replicaof.expect("Invalid replicaof");
+            let (addr, port) = replicaof.split_once(" ").expect("Invalid port");
+            GlobalConfig {
+                instance_type: InstanceType::Slave,
+                master_address: Some(addr.to_string()),
+                master_port: Some(port.parse().unwrap()),
+            }
+        } else {
+            GlobalConfig {
+                instance_type: InstanceType::Master,
+                master_address: None,
+                master_port: None,
+            }
+        })
+        .map_err(|_| anyhow!("Failed to set instance type"))?;
+
+    let global_config = GLOBAL_CONFIG.get().unwrap();
+
+    if global_config.instance_type == InstanceType::Slave {
+        let mut stream = TcpStream::connect(format!(
+            "{}:{}",
+            global_config.master_address.clone().unwrap(),
+            global_config.master_port.unwrap()
+        )).await?;
+
+        stream.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+    }
 
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
@@ -108,7 +146,8 @@ async fn process(
                                 send_response(&mut socket, &resp).await?;
                             }
                             Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
-                                let resp = handle_discard(&mut transaction_queue, &mut transaction_active);
+                                let resp =
+                                    handle_discard(&mut transaction_queue, &mut transaction_active);
                                 send_response(&mut socket, &resp).await?;
                             }
                             _ => {
@@ -888,7 +927,7 @@ fn queue_command(
 
 fn handle_discard(
     transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
-    transaction_active: &mut bool
+    transaction_active: &mut bool,
 ) -> Bytes {
     transaction_queue.clear();
     *transaction_active = false;
@@ -898,15 +937,17 @@ fn handle_discard(
 fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
     match v[1].to_str().map(|s| s.to_ascii_lowercase()) {
         Some(s) if s == "replication" => {
-            let instance_type = INSTANCE_TYPE.get().unwrap();
-            let mut lines = vec![format!("role:{instance_type}")];
-            if *instance_type == InstanceType::Master {
-                lines.push(format!("master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"));
+            let global_config = GLOBAL_CONFIG.get().unwrap();
+            let mut lines = vec![format!("role:{}", global_config.instance_type)];
+            if global_config.instance_type == InstanceType::Master {
+                lines.push(format!(
+                    "master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+                ));
                 lines.push(format!("master_repl_offset:0"));
             }
             Ok(bulk_string(lines.join("\r\n").as_str()))
-        },
-        _ => bail!(format!("INFO: Invalid argument {:?}", v[1]))
+        }
+        _ => bail!(format!("INFO: Invalid argument {:?}", v[1])),
     }
 }
 
