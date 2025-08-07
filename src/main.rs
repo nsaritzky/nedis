@@ -51,8 +51,19 @@ impl Display for InstanceType {
 #[derive(PartialEq, Eq, Clone, Debug)]
 struct GlobalConfig {
     instance_type: InstanceType,
-    master_address: Option<String>,
-    master_port: Option<usize>,
+    master_config: Option<MasterConfig>,
+    slave_config: Option<SlaveConfig>
+}
+
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct SlaveConfig {
+    master_address: String,
+    master_port: usize
+}
+
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct MasterConfig {
+    replication_id: String
 }
 
 static GLOBAL_CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
@@ -68,18 +79,25 @@ async fn main() -> anyhow::Result<()> {
 
     GLOBAL_CONFIG
         .set(if args.replicaof.is_some() {
-            let replicaof = args.replicaof.expect("Invalid replicaof");
-            let (addr, port) = replicaof.split_once(" ").expect("Invalid port");
+            let replicaof = args.replicaof.unwrap();
+            let (addr, port) = replicaof.split_once(" ").expect("Invalid replicaof");
+            let slave_config = Some(SlaveConfig{
+                master_address: addr.to_string(),
+                master_port: port.parse().expect("Invalid master port")
+            });
             GlobalConfig {
                 instance_type: InstanceType::Slave,
-                master_address: Some(addr.to_string()),
-                master_port: Some(port.parse().unwrap()),
+                slave_config,
+                master_config: None
             }
         } else {
+            let master_config = Some(MasterConfig{
+                replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string()
+            });
             GlobalConfig {
                 instance_type: InstanceType::Master,
-                master_address: None,
-                master_port: None,
+                slave_config: None,
+                master_config
             }
         })
         .map_err(|_| anyhow!("Failed to set instance type"))?;
@@ -202,6 +220,7 @@ async fn execute_command(
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
             "REPLCONF" => Ok("+OK\r\n".into()),
+            "PSYNC" => handle_psync(),
             _ => {
                 bail!("Invalid command")
             }
@@ -213,11 +232,12 @@ async fn execute_command(
 
 async fn send_handshake() -> anyhow::Result<()> {
     let global_config = GLOBAL_CONFIG.get().unwrap();
+    let slave_config = global_config.slave_config.as_ref().unwrap();
 
     let mut stream = TcpStream::connect(format!(
         "{}:{}",
-        global_config.master_address.clone().unwrap(),
-        global_config.master_port.unwrap()
+        slave_config.master_address.clone(),
+        slave_config.master_port
     ))
     .await?;
 
@@ -985,6 +1005,13 @@ fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
         }
         _ => bail!(format!("INFO: Invalid argument {:?}", v[1])),
     }
+}
+
+fn handle_psync() -> anyhow::Result<Bytes> {
+    let global_config = GLOBAL_CONFIG.get().unwrap();
+    let master_config = global_config.master_config.clone().ok_or(anyhow!("Called PSYNC on a replica"))?;
+
+    Ok(format!("+FULLRESYNC {} 0\r\n", master_config.replication_id).into())
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
