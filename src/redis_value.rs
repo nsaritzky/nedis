@@ -157,6 +157,12 @@ impl From<isize> for RedisValue {
     }
 }
 
+impl From<VecDeque<RedisValue>> for RedisValue {
+    fn from(value: VecDeque<RedisValue>) -> Self {
+        RedisValue::Arr(value)
+    }
+}
+
 #[derive(Debug)]
 pub struct StreamElement {
     pub id: String,

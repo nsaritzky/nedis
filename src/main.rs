@@ -27,6 +27,7 @@ use winnow::stream;
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
+type TransactionQueue = Arc<Mutex<(VecDeque<RedisValue>, bool)>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
+    let transaction_queue: TransactionQueue = Arc::new(Mutex::new((VecDeque::new(), false)));
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -42,9 +44,10 @@ async fn main() -> anyhow::Result<()> {
         let db = Arc::clone(&db);
         let blocks = Arc::clone(&blocks);
         let streams = Arc::clone(&streams);
+        let transaction_queue = Arc::clone(&transaction_queue);
 
         tokio::spawn(async move {
-            process(socket, db, blocks, streams)
+            process(socket, db, blocks, streams, transaction_queue)
                 .await
                 .expect("Process should be successful");
         });
@@ -56,6 +59,7 @@ async fn process(
     db: Db,
     blocks: Blocks,
     streams: Streams,
+    transaction_queue: TransactionQueue,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
 
@@ -119,10 +123,10 @@ async fn process(
                                     handle_incr(&db, &mut v, &mut i, &mut socket).await?;
                                 }
                                 "MULTI" => {
-                                    handle_multi(&mut v, &mut i, &mut socket).await?;
+                                    handle_multi(&transaction_queue, &mut v, &mut i, &mut socket).await?;
                                 }
                                 "EXEC" => {
-                                    handle_exec(&mut socket).await?;
+                                    handle_exec(&transaction_queue, &mut socket).await?;
                                 }
                                 _ => {}
                             }
@@ -841,15 +845,24 @@ async fn handle_incr(
 }
 
 async fn handle_multi(
+    transaction_queue: &TransactionQueue,
     v: &mut VecDeque<RedisValue>,
     i: &mut usize,
     socket: &mut TcpStream,
 ) -> anyhow::Result<()> {
+    let mut guard = transaction_queue.lock().await;
+    guard.1 = true;
     send_response(socket, b"+OK\r\n").await
 }
 
-async fn handle_exec(socket: &mut TcpStream) -> anyhow::Result<()> {
-    send_response(socket, b"-ERR EXEC without MULTI\r\n").await
+async fn handle_exec(transaction_queue: &TransactionQueue, socket: &mut TcpStream) -> anyhow::Result<()> {
+    let mut guard = transaction_queue.lock().await;
+    if guard.1 {
+        guard.1 = false;
+        send_response(socket, b"*0\r\n").await
+    } else {
+        send_response(socket, b"-ERR EXEC without MULTI\r\n").await
+    }
 }
 
 async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
