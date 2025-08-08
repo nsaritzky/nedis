@@ -219,14 +219,15 @@ async fn process(
                 match input_len {
                     Ok(0) => break,
                     Ok(n) => {
-                        if buf.len() >= empty_rdb_bytes.len() && (buf[..empty_rdb_bytes.len()] == empty_rdb_bytes) {
-                            let _ = buf.split_to(empty_rdb_bytes.len());
-                            if buf.len() == 0 {
-                                continue;
+                        if buf.len() >= empty_rdb_bytes.len() &&
+                            (buf[..empty_rdb_bytes.len()] == empty_rdb_bytes) {
+                                let _ = buf.split_to(empty_rdb_bytes.len());
+                                if buf.len() == 0 {
+                                    continue;
+                                }
                             }
-                        }
                         let results =
-                            parse_values(&mut &buf[..n])
+                            parse_values(&mut &buf[..])
                             .map_err(|_| anyhow!("Failed to parse: {}", String::from_utf8_lossy(&buf[..n])))?;
 
                         let stream_tx = stream_tx.clone();
@@ -719,15 +720,14 @@ async fn handle_blpop(
                 }
             }
 
-            if let Ok(mut db) = db.try_lock() {
-                if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
-                    if let Some(value) = array.pop_front() {
-                        let mut blocks = blocks.lock().await;
-                        if let Some(blocks_set) = blocks.get_mut(&key) {
-                            let (_, id) =
-                                blocks_set.first().expect("Blocks set should be nonempty");
-
-                            if *id == task::id().to_string() {
+            let mut db = db.lock().await;
+            if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
+                if !array.is_empty() {
+                    let mut blocks = blocks.lock().await;
+                    if let Some(blocks_set) = blocks.get_mut(&key) {
+                        if let Some((_, first_id)) = blocks_set.first() {
+                            if *first_id == task::id().to_string() {
+                                let value = array.pop_front().unwrap();
                                 blocks_set.pop_first();
 
                                 if blocks_set.is_empty() {
