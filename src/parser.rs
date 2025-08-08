@@ -14,8 +14,15 @@ use winnow::{
     Parser, Result,
 };
 
-pub fn parse_values(input: &mut &[u8]) -> Result<Vec<RedisValue>> {
-    repeat(1.., parse_value).parse_next(input)
+pub fn parse_values_with_len(input: &mut &[u8]) -> Result<Vec<(RedisValue, usize)>> {
+    repeat(0.., parse_value_with_len).parse_next(input)
+}
+
+pub fn parse_value_with_len(input: &mut &[u8]) -> Result<(RedisValue, usize)> {
+    let start_len = input.len();
+    let result = parse_value.parse_next(input)?;
+    let consumed = start_len - input.len();
+    Ok((result, consumed))
 }
 
 pub fn parse_value<'a>(input: &mut &'a [u8]) -> Result<RedisValue> {

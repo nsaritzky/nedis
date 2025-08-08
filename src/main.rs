@@ -7,8 +7,8 @@ use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     fmt::{self, Display, Formatter},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, LazyLock, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,10 +26,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{
-        broadcast::{error::RecvError, Receiver},
-        mpsc, Mutex,
-    },
+    sync::{broadcast::error::RecvError, mpsc, Mutex},
     time::interval,
 };
 use tokio::{
@@ -38,12 +35,18 @@ use tokio::{
 };
 
 const EMPTY_RDB_FILE: &str = include_str!("../resources/empty_rdb.hex");
+const EMPTY_RDB_BYTES: LazyLock<Bytes> = LazyLock::new(|| {
+    let mut res = BytesMut::new();
+    let raw_bytes = &parse_hex_string(EMPTY_RDB_FILE).unwrap();
+    res.extend_from_slice(format!("${}\r\n", raw_bytes.len()).as_bytes());
+    res.extend_from_slice(raw_bytes);
+    res.freeze()
+});
 const WRITE_COMMANDS: [&str; 7] = ["SET", "DEL", "RPUSH", "LPOP", "BLPOP", "XADD", "INCR"];
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
-type TransactionQueue = Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum InstanceType {
@@ -190,19 +193,14 @@ async fn process(
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let transaction_active = Arc::new(Mutex::new(false));
-    let transaction_queue = Arc::new(Mutex::new(VecDeque::<VecDeque<RedisValue>>::new()));
+    let transaction_queue = Arc::new(Mutex::new(VecDeque::<(VecDeque<RedisValue>, usize)>::new()));
 
     let mut replica_receiver = replica_tx.subscribe();
     let is_replica_conn = Arc::new(AtomicBool::new(false));
+    let replica_offset = Arc::new(AtomicUsize::new(0));
 
     let (mut stream_reader, mut stream_writer) = stream.into_split();
     let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(100);
-
-    let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
-    let mut empty_rdb_bytes = BytesMut::new();
-    empty_rdb_bytes.extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
-    empty_rdb_bytes.extend_from_slice(&empty_rdb_file);
-    let empty_rdb_bytes = empty_rdb_bytes.freeze();
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = stream_rx.recv().await {
@@ -219,16 +217,17 @@ async fn process(
                 match input_len {
                     Ok(0) => break,
                     Ok(n) => {
-                        if buf.len() >= empty_rdb_bytes.len() &&
-                            (buf[..empty_rdb_bytes.len()] == empty_rdb_bytes) {
-                                let _ = buf.split_to(empty_rdb_bytes.len());
-                                if buf.len() == 0 {
-                                    continue;
-                                }
+                        if n >= EMPTY_RDB_BYTES.len() &&
+                            (buf[..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES) {
+                                let _ = buf.split_to(EMPTY_RDB_BYTES.len());
+                                println!("Received RDB file; resetting replica offset");
+                                replica_offset.store(0, Ordering::SeqCst);
+                                // if buf.len() == 0 {
+                                //     continue;
+                                // }
                             }
-                        let results =
-                            parse_values(&mut &buf[..])
-                            .map_err(|_| anyhow!("Failed to parse: {}", String::from_utf8_lossy(&buf[..n])))?;
+                        let results = parse_values_with_len(&mut &buf[..])
+                            .map_err(|e| anyhow!(e))?;
 
                         let stream_tx = stream_tx.clone();
 
@@ -239,6 +238,7 @@ async fn process(
                         let streams = Arc::clone(&streams);
                         let replica_tx = replica_tx.clone();
                         let is_replica_conn = Arc::clone(&is_replica_conn);
+                        let process_replica_offset = Arc::clone(&replica_offset);
 
                         tokio::spawn(async move {
                             if let Err(e) = process_input(
@@ -252,11 +252,11 @@ async fn process(
                                 replica_tx,
                                 is_replica_conn,
                                 is_replication_conn,
+                                process_replica_offset,
                             ).await {
                                 eprintln!("Error in processing task: {e}");
                             }
                         });
-
 
                         buf.clear();
                     }
@@ -281,9 +281,9 @@ async fn process(
 }
 
 async fn process_input(
-    results: Vec<RedisValue>,
+    results: Vec<(RedisValue, usize)>,
     transaction_active: Arc<Mutex<bool>>,
-    transaction_queue: Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>,
+    transaction_queue: Arc<Mutex<VecDeque<(VecDeque<RedisValue>, usize)>>>,
     db: Db,
     blocks: Blocks,
     streams: Streams,
@@ -291,8 +291,9 @@ async fn process_input(
     replica_tx: broadcast::Sender<Bytes>,
     is_replica_conn: Arc<AtomicBool>,
     is_replication_conn: bool,
+    replica_offset: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
-    for result in results {
+    for (result, message_len) in results {
         if let RedisValue::Arr(mut v) = result {
             let mut transaction_active = transaction_active.lock().await;
 
@@ -307,6 +308,7 @@ async fn process_input(
                             &blocks,
                             &streams,
                             &mut transaction_active,
+                            Arc::clone(&replica_offset),
                         )
                         .await?;
                         stream_tx.send(resp).await?;
@@ -316,7 +318,7 @@ async fn process_input(
                         stream_tx.send(resp).await?;
                     }
                     _ => {
-                        let resp = queue_command(&mut transaction_queue, v);
+                        let resp = queue_command(&mut transaction_queue, message_len, v);
                         stream_tx.send(resp).await?;
                     }
                 }
@@ -324,24 +326,29 @@ async fn process_input(
             } else if v[0].to_str().map(|s| s.to_ascii_uppercase()) == Some("PSYNC".to_string()) {
                 let resp = handle_psync()?;
                 stream_tx.send(resp).await?;
-
-                let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
-                let mut empty_rdb_resp = BytesMut::new();
-                empty_rdb_resp
-                    .extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
-                empty_rdb_resp.extend_from_slice(&empty_rdb_file);
-                stream_tx.send(empty_rdb_resp.freeze()).await?;
+                stream_tx.send(EMPTY_RDB_BYTES.clone()).await?;
 
                 is_replica_conn.store(true, Ordering::Relaxed);
             } else {
+                replica_offset.fetch_add(message_len, Ordering::SeqCst);
+
                 if GLOBAL_CONFIG.get().unwrap().instance_type == InstanceType::Master {
                     if WRITE_COMMANDS.contains(&v[0].to_str().unwrap()) {
                         replica_tx.send(vec_of_values_to_resp(&v))?;
                     }
                 }
-                let resp = execute_command(&mut v, &db, &blocks, &streams, &mut transaction_active)
-                    .await?;
-                if is_replication_conn {
+                let resp = execute_command(
+                    &mut v,
+                    &db,
+                    &blocks,
+                    &streams,
+                    &mut transaction_active,
+                    Arc::clone(&replica_offset),
+                    message_len,
+                )
+                .await?;
+
+                let should_send_response = if is_replication_conn {
                     match (
                         v.get(0).and_then(|val| val.to_str()),
                         v.get(1).and_then(|val| val.to_str()),
@@ -350,11 +357,15 @@ async fn process_input(
                             if a.to_ascii_uppercase() == "REPLCONF"
                                 && b.to_ascii_uppercase() == "GETACK" =>
                         {
-                            stream_tx.send(resp).await?
+                            true
                         }
-                        _ => {}
+                        _ => false,
                     }
                 } else {
+                    true
+                };
+
+                if should_send_response {
                     stream_tx.send(resp).await?;
                 }
             }
@@ -370,8 +381,11 @@ async fn execute_command(
     blocks: &Blocks,
     streams: &Streams,
     transaction_active: &mut bool,
+    replica_offset: Arc<AtomicUsize>,
+    message_len: usize,
 ) -> anyhow::Result<Bytes> {
     let mut i = 0;
+
     if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = &v[i] {
         match s.to_ascii_uppercase().as_str() {
             "PING" => Ok("+PONG\r\n".into()),
@@ -396,7 +410,7 @@ async fn execute_command(
             "INFO" => handle_info(v),
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
-            "REPLCONF" => handle_replconf(v),
+            "REPLCONF" => handle_replconf(v, replica_offset, message_len),
             _ => {
                 bail!("Invalid command")
             }
@@ -1118,18 +1132,28 @@ async fn handle_multi(transaction_active: &mut bool) -> anyhow::Result<Bytes> {
 }
 
 async fn handle_exec(
-    transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
+    transaction_queue: &mut VecDeque<(VecDeque<RedisValue>, usize)>,
     db: &Db,
     blocks: &Blocks,
     streams: &Streams,
     transaction_active: &mut bool,
+    replica_offset: Arc<AtomicUsize>,
 ) -> anyhow::Result<Bytes> {
     let mut buf = BytesMut::new();
 
     buf.put_slice(format!("*{}\r\n", transaction_queue.len()).as_bytes());
 
-    for args in transaction_queue {
-        let resp = execute_command(args, db, blocks, streams, transaction_active).await?;
+    for (args, message_len) in transaction_queue {
+        let resp = execute_command(
+            args,
+            db,
+            blocks,
+            streams,
+            transaction_active,
+            Arc::clone(&replica_offset),
+            *message_len,
+        )
+        .await?;
         buf.put_slice(&resp);
     }
 
@@ -1139,15 +1163,16 @@ async fn handle_exec(
 }
 
 fn queue_command(
-    transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
+    transaction_queue: &mut VecDeque<(VecDeque<RedisValue>, usize)>,
+    message_len: usize,
     args: VecDeque<RedisValue>,
 ) -> Bytes {
-    transaction_queue.push_back(args);
+    transaction_queue.push_back((args, message_len));
     "+QUEUED\r\n".into()
 }
 
 fn handle_discard(
-    transaction_queue: &mut VecDeque<VecDeque<RedisValue>>,
+    transaction_queue: &mut VecDeque<(VecDeque<RedisValue>, usize)>,
     transaction_active: &mut bool,
 ) -> Bytes {
     transaction_queue.clear();
@@ -1182,10 +1207,20 @@ fn handle_psync() -> anyhow::Result<Bytes> {
     Ok(format!("+FULLRESYNC {} 0\r\n", master_config.replication_id).into())
 }
 
-fn handle_replconf(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
+fn handle_replconf(
+    v: &mut VecDeque<RedisValue>,
+    replica_offset: Arc<AtomicUsize>,
+    message_len: usize,
+) -> anyhow::Result<Bytes> {
     if let Some(s) = v.get(1).and_then(|val| val.to_str()) {
         if s.to_ascii_uppercase() == "GETACK" {
-            Ok("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n".into())
+            let offset = replica_offset.load(Ordering::SeqCst) - message_len;
+            let resp_vec = vec![
+                RedisValue::Primitive(PrimitiveRedisValue::Str("REPLCONF".to_string())),
+                RedisValue::Primitive(PrimitiveRedisValue::Str("ACK".to_string())),
+                RedisValue::Primitive(PrimitiveRedisValue::Str(offset.to_string())),
+            ];
+            Ok(vec_of_values_to_resp(&resp_vec.into()))
         } else {
             Ok("+OK\r\n".into())
         }

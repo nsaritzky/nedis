@@ -133,6 +133,10 @@ impl RedisValue {
         }
     }
 
+    pub fn to_uppercase_string(&self) -> Option<String> {
+        self.to_str().map(|s| s.to_ascii_uppercase())
+    }
+
     pub fn to_primitive(&self) -> Option<&PrimitiveRedisValue> {
         if let RedisValue::Primitive(p) = self {
             Some(p)
