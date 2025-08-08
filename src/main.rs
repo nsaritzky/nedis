@@ -6,7 +6,7 @@ mod redis_value;
 use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     fmt::{self, Display, Formatter},
-    sync::{Arc, OnceLock},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,19 +20,27 @@ use itertools::Itertools;
 use num::ToPrimitive;
 use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
 use thiserror::Error;
-use tokio::task;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{
+        broadcast::{error::RecvError, Receiver},
+        mpsc, Mutex,
+    },
     time::interval,
+};
+use tokio::{
+    sync::broadcast::{self, Sender},
+    task,
 };
 
 const EMPTY_RDB_FILE: &str = include_str!("../resources/empty_rdb.hex");
+const WRITE_COMMANDS: [&str; 7] = ["SET", "DEL", "RPUSH", "LPOP", "BLPOP", "XADD", "INCR"];
 
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
+type TransactionQueue = Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum InstanceType {
@@ -112,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
 
+    let (replica_tx, _) = broadcast::channel::<Bytes>(32);
+
     loop {
         let (socket, _) = listener.accept().await.unwrap();
 
@@ -119,8 +129,10 @@ async fn main() -> anyhow::Result<()> {
         let blocks = Arc::clone(&blocks);
         let streams = Arc::clone(&streams);
 
+        let replica_tx = replica_tx.clone();
+
         tokio::spawn(async move {
-            process(socket, db, blocks, streams)
+            process(socket, db, blocks, streams, replica_tx)
                 .await
                 .expect("Process should be successful");
         });
@@ -128,73 +140,151 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn process(
-    mut socket: TcpStream,
+    stream: TcpStream,
     db: Db,
     blocks: Blocks,
     streams: Streams,
+    replica_tx: Sender<Bytes>,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
-    let mut transaction_active = false;
-    let mut transaction_queue = VecDeque::<VecDeque<RedisValue>>::new();
+    let transaction_active = Arc::new(Mutex::new(false));
+    let transaction_queue = Arc::new(Mutex::new(VecDeque::<VecDeque<RedisValue>>::new()));
+
+    let mut replica_receiver = replica_tx.subscribe();
+    let is_replica_conn = Arc::new(AtomicBool::new(false));
+
+    let (mut stream_reader, mut stream_writer) = stream.into_split();
+    let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(100);
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = stream_rx.recv().await {
+            if let Err(e) = stream_writer.write_all(&msg).await {
+                eprintln!("Stream write error: {e}");
+                break;
+            }
+        }
+    });
 
     loop {
-        match socket.read_buf(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let results =
-                    parse_value(&mut &buf[..n]).map_err(|e| anyhow!("Failed to parse: {e}"))?;
-                if let RedisValue::Arr(mut v) = results {
-                    if transaction_active {
-                        match v[0].to_str() {
-                            Some(s) if s.to_ascii_uppercase() == "EXEC" => {
-                                let resp = handle_exec(
-                                    &mut transaction_queue,
-                                    &db,
-                                    &blocks,
-                                    &streams,
-                                    &mut transaction_active,
-                                )
-                                .await?;
-                                send_response(&mut socket, &resp).await?;
-                            }
-                            Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
-                                let resp =
-                                    handle_discard(&mut transaction_queue, &mut transaction_active);
-                                send_response(&mut socket, &resp).await?;
-                            }
-                            _ => {
-                                let resp = queue_command(&mut transaction_queue, v);
-                                send_response(&mut socket, &resp).await?;
-                            }
-                        }
-                        // PSYNC sends two responses, so it needs special handling
-                    } else if v[0].to_str().map(|s| s.to_ascii_uppercase())
-                        == Some("PSYNC".to_string())
-                    {
-                        let resp = handle_psync()?;
-                        send_response(&mut socket, &resp).await?;
+        tokio::select! {
+            input = stream_reader.read_buf(&mut buf) => {
+                match input {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let results =
+                            parse_value(&mut &buf[..n]).map_err(|e| anyhow!("Failed to parse: {e}"))?;
 
-                        let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
-                        let mut empty_rdb_resp = BytesMut::new();
-                        empty_rdb_resp.extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
-                        empty_rdb_resp.extend_from_slice(&empty_rdb_file);
-                        send_response(&mut socket, &empty_rdb_resp).await?;
-                    } else {
-                        let resp = execute_command(
-                            &mut v,
-                            &db,
-                            &blocks,
-                            &streams,
-                            &mut transaction_active,
-                        )
-                        .await?;
-                        send_response(&mut socket, &resp).await?;
+                        let stream_tx = stream_tx.clone();
+
+                        let transaction_active = Arc::clone(&transaction_active);
+                        let transaction_queue = Arc::clone(&transaction_queue);
+                        let db = Arc::clone(&db);
+                        let blocks = Arc::clone(&blocks);
+                        let streams = Arc::clone(&streams);
+                        let replica_tx = replica_tx.clone();
+                        let is_replica_conn = Arc::clone(&is_replica_conn);
+
+                        tokio::spawn(async move {
+                            if let RedisValue::Arr(_) = results {
+                                if let Err(e) = process_input(
+                                    results,
+                                    transaction_active,
+                                    transaction_queue,
+                                    db,
+                                    blocks,
+                                    streams,
+                                    stream_tx,
+                                    replica_tx,
+                                    is_replica_conn,
+                                ).await {
+                                    eprintln!("Error in processing task: {e}");
+                                }
+                            }
+                        });
+
+
+                        buf.clear();
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            msg = replica_receiver.recv() => {
+                if is_replica_conn.load(Ordering::Relaxed) {
+                    match msg {
+                        Ok(msg) => stream_tx.send(msg).await?,
+                        Err(RecvError::Closed) => break,
+                        Err(RecvError::Lagged(n)) => println!("Missed {n} messages"),
                     }
                 }
-
-                buf.clear();
             }
-            Err(_) => break,
+        }
+    }
+
+    let _ = writer.await;
+    Ok(())
+}
+
+async fn process_input(
+    results: RedisValue,
+    transaction_active: Arc<Mutex<bool>>,
+    transaction_queue: Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>,
+    db: Db,
+    blocks: Blocks,
+    streams: Streams,
+    stream_tx: mpsc::Sender<Bytes>,
+    replica_tx: broadcast::Sender<Bytes>,
+    is_replica_conn: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    if let RedisValue::Arr(mut v) = results {
+        let mut transaction_active = transaction_active.lock().await;
+
+        if *transaction_active {
+            let mut transaction_queue = transaction_queue.lock().await;
+
+            match v[0].to_str() {
+                Some(s) if s.to_ascii_uppercase() == "EXEC" => {
+                    let resp = handle_exec(
+                        &mut transaction_queue,
+                        &db,
+                        &blocks,
+                        &streams,
+                        &mut transaction_active,
+                    )
+                    .await?;
+                    stream_tx.send(resp).await?;
+                }
+                Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
+                    let resp = handle_discard(&mut transaction_queue, &mut transaction_active);
+                    stream_tx.send(resp).await?;
+                }
+                _ => {
+                    let resp = queue_command(&mut transaction_queue, v);
+                    stream_tx.send(resp).await?;
+                }
+            }
+            // PSYNC sends two responses, so it needs special handling
+        } else if v[0].to_str().map(|s| s.to_ascii_uppercase()) == Some("PSYNC".to_string()) {
+            let resp = handle_psync()?;
+            stream_tx.send(resp).await?;
+
+            let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
+            let mut empty_rdb_resp = BytesMut::new();
+            empty_rdb_resp.extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
+            empty_rdb_resp.extend_from_slice(&empty_rdb_file);
+            stream_tx.send(empty_rdb_resp.freeze()).await?;
+
+            is_replica_conn.store(true, Ordering::Relaxed);
+        } else {
+            if GLOBAL_CONFIG.get().unwrap().instance_type == InstanceType::Master {
+                if WRITE_COMMANDS.contains(&v[0].to_str().unwrap()) {
+                    println!("Propagating");
+                    replica_tx.send(vec_of_values_to_resp(&v))?;
+                }
+            }
+            let resp =
+                execute_command(&mut v, &db, &blocks, &streams, &mut transaction_active).await?;
+            stream_tx.send(resp).await?;
         }
     }
 
@@ -234,7 +324,6 @@ async fn execute_command(
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
             "REPLCONF" => Ok("+OK\r\n".into()),
-            "PSYNC" => handle_psync(),
             _ => {
                 bail!("Invalid command")
             }
@@ -1202,6 +1291,17 @@ fn parse_id_with_dollar_sign(input: &str, stream_vec: &Vec<StreamElement>) -> (u
         start_timestamp.parse().unwrap(),
         start_sequence.parse().unwrap(),
     )
+}
+
+fn vec_of_values_to_resp(v: &VecDeque<RedisValue>) -> Bytes {
+    let mut buf = BytesMut::new();
+
+    buf.extend_from_slice(format!("*{}\r\n", v.len()).as_bytes());
+    for val in v {
+        buf.extend_from_slice(&val.to_bytes());
+    }
+
+    buf.freeze()
 }
 
 #[derive(Error, Debug)]

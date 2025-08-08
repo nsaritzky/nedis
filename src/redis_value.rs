@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::{HashMap, VecDeque}};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num::BigInt;
@@ -33,13 +36,13 @@ impl PrimitiveRedisValue {
         match self {
             PrimitiveRedisValue::Str(s) | PrimitiveRedisValue::Error(s) => {
                 buf.put_slice(&bulk_string(s));
-            },
+            }
             PrimitiveRedisValue::Int(n) => {
                 buf.put_slice(format!(":{n}\r\n").as_bytes());
-            },
+            }
             PrimitiveRedisValue::Null => {
                 buf.put_slice(b"_\r\n");
-            },
+            }
             PrimitiveRedisValue::NilString => {
                 buf.put_slice(b"$-1\r\n");
             }
@@ -49,10 +52,10 @@ impl PrimitiveRedisValue {
                 } else {
                     buf.put_slice(b"#f\r\n");
                 }
-            },
+            }
             PrimitiveRedisValue::BigInt(n) => {
                 buf.put_slice(format!("({n}\r\n").as_bytes());
-            },
+            }
             PrimitiveRedisValue::Verbatim(encoding, data) => {
                 buf.put_slice(format!("={}\r\n", encoding.len() + data.len() + 1).as_bytes());
                 buf.put_slice(encoding);
@@ -81,36 +84,36 @@ impl RedisValue {
         match self {
             RedisValue::Primitive(val) => {
                 buf.put_slice(&val.to_bytes());
-            },
+            }
             RedisValue::Arr(vec) => {
                 buf.put_slice(format!("*{}\r\n", vec.len()).as_bytes());
                 for val in vec {
                     buf.put_slice(&val.to_bytes());
                 }
-            },
+            }
             RedisValue::Double(x) => {
                 buf.put_slice(format!(",{x}\r\n").as_bytes());
-            },
+            }
             RedisValue::Map(map) => {
                 buf.put_slice(format!("%{}\r\n", map.len()).as_bytes());
                 for (key, val) in map.iter() {
                     buf.put_slice(&key.to_bytes());
                     buf.put_slice(&val.to_bytes());
                 }
-            },
+            }
             RedisValue::Attribute(map) => {
                 buf.put_slice(format!("|{}\r\n", map.len()).as_bytes());
                 for (key, val) in map.iter() {
                     buf.put_slice(&key.to_bytes());
                     buf.put_slice(&val.to_bytes());
                 }
-            },
+            }
             RedisValue::Set(vec) => {
                 buf.put_slice(format!("~{}\r\n", vec.len()).as_bytes());
                 for val in vec {
                     buf.put_slice(&val.to_bytes());
                 }
-            },
+            }
             RedisValue::Push(vec) => {
                 buf.put_slice(format!(">{}\r\n", vec.len()).as_bytes());
                 for val in vec {
@@ -166,12 +169,12 @@ impl From<VecDeque<RedisValue>> for RedisValue {
 #[derive(Debug)]
 pub struct StreamElement {
     pub id: String,
-    pub value: HashMap<PrimitiveRedisValue, RedisValue>
+    pub value: HashMap<PrimitiveRedisValue, RedisValue>,
 }
 
 impl StreamElement {
     pub fn new(id: String, value: HashMap<PrimitiveRedisValue, RedisValue>) -> Self {
-        StreamElement{ id, value }
+        StreamElement { id, value }
     }
 }
 

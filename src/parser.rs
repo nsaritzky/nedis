@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, VecDeque}, str::FromStr};
+use std::{
+    collections::{HashMap, VecDeque},
+    str::FromStr,
+};
 
 use crate::redis_value::{PrimitiveRedisValue, RedisValue};
 use num::BigInt;
