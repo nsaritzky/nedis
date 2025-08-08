@@ -411,6 +411,7 @@ async fn execute_command(
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
             "REPLCONF" => handle_replconf(v, replica_offset, message_len),
+            "WAIT" => handle_wait(),
             _ => {
                 bail!("Invalid command")
             }
@@ -1227,6 +1228,10 @@ fn handle_replconf(
     } else {
         Ok("+OK\r\n".into())
     }
+}
+
+fn handle_wait() -> anyhow::Result<Bytes> {
+    Ok(":0\r\n".into())
 }
 
 fn gather_stream_read_results(
