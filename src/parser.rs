@@ -10,10 +10,13 @@ use winnow::{
     combinator::{
         alt, delimited, dispatch, fail, opt, preceded, repeat, separated_pair, terminated,
     },
-    stream::Stream,
-    token::{any, literal, one_of, take, take_until},
+    token::{any, one_of, take, take_until},
     Parser, Result,
 };
+
+pub fn parse_values(input: &mut &[u8]) -> Result<Vec<RedisValue>> {
+    repeat(1.., parse_value).parse_next(input)
+}
 
 pub fn parse_value<'a>(input: &mut &'a [u8]) -> Result<RedisValue> {
     dispatch! {any;

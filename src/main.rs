@@ -6,7 +6,10 @@ mod redis_value;
 use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     fmt::{self, Display, Formatter},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -58,14 +61,14 @@ impl Display for InstanceType {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Debug)]
 struct GlobalConfig {
     instance_type: InstanceType,
     master_config: Option<MasterConfig>,
     slave_config: Option<SlaveConfig>,
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Debug)]
 struct SlaveConfig {
     master_address: String,
     master_port: usize,
@@ -112,31 +115,69 @@ async fn main() -> anyhow::Result<()> {
         })
         .map_err(|_| anyhow!("Failed to set instance type"))?;
 
-    if is_replica {
-        send_handshake().await?;
-    }
-
     let db: Db = Arc::new(Mutex::new(HashMap::new()));
     let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
 
     let (replica_tx, _) = broadcast::channel::<Bytes>(32);
 
-    loop {
-        let (socket, _) = listener.accept().await.unwrap();
+    let loop_db = Arc::clone(&db);
+    let loop_blocks = Arc::clone(&blocks);
+    let loop_streams = Arc::clone(&streams);
+    let loop_replica_tx = replica_tx.clone();
 
-        let db = Arc::clone(&db);
-        let blocks = Arc::clone(&blocks);
-        let streams = Arc::clone(&streams);
+    let server_handle = tokio::spawn(async move {
+        loop {
+            let (socket, addr) = listener.accept().await.unwrap();
+            println!("Accepting connection from {addr}");
 
-        let replica_tx = replica_tx.clone();
+            let db = Arc::clone(&loop_db);
+            let blocks = Arc::clone(&loop_blocks);
+            let streams = Arc::clone(&loop_streams);
+
+            let replica_tx = loop_replica_tx.clone();
+
+            tokio::spawn(async move {
+                process(socket, db, blocks, streams, replica_tx, false)
+                    .await
+                    .expect("Process should be successful");
+            });
+        }
+    });
+
+    if is_replica {
+        let global_config = GLOBAL_CONFIG.get().unwrap();
+        let slave_config = global_config.slave_config.as_ref().unwrap();
+
+        let replica_db = Arc::clone(&db);
+        let replica_blocks = Arc::clone(&blocks);
+        let replica_streams = Arc::clone(&streams);
+
+        let mut master_stream = TcpStream::connect(format!(
+            "{}:{}",
+            slave_config.master_address, slave_config.master_port
+        ))
+        .await?;
+
+        send_handshake(&mut master_stream).await?;
 
         tokio::spawn(async move {
-            process(socket, db, blocks, streams, replica_tx)
-                .await
-                .expect("Process should be successful");
+            process(
+                master_stream,
+                replica_db,
+                replica_blocks,
+                replica_streams,
+                replica_tx,
+                true,
+            )
+            .await
+            .expect("Master connection process should be successful");
         });
     }
+
+    server_handle.await?;
+
+    Ok(())
 }
 
 async fn process(
@@ -145,6 +186,7 @@ async fn process(
     blocks: Blocks,
     streams: Streams,
     replica_tx: Sender<Bytes>,
+    is_master_conn: bool,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let transaction_active = Arc::new(Mutex::new(false));
@@ -155,6 +197,12 @@ async fn process(
 
     let (mut stream_reader, mut stream_writer) = stream.into_split();
     let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(100);
+
+    let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
+    let mut empty_rdb_bytes = BytesMut::new();
+    empty_rdb_bytes.extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
+    empty_rdb_bytes.extend_from_slice(&empty_rdb_file);
+    let empty_rdb_bytes = empty_rdb_bytes.freeze();
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = stream_rx.recv().await {
@@ -167,12 +215,19 @@ async fn process(
 
     loop {
         tokio::select! {
-            input = stream_reader.read_buf(&mut buf) => {
-                match input {
+            input_len = stream_reader.read_buf(&mut buf) => {
+                match input_len {
                     Ok(0) => break,
                     Ok(n) => {
+                        if buf.len() >= empty_rdb_bytes.len() && (buf[..empty_rdb_bytes.len()] == empty_rdb_bytes) {
+                            let _ = buf.split_to(empty_rdb_bytes.len());
+                            if buf.len() == 0 {
+                                continue;
+                            }
+                        }
                         let results =
-                            parse_value(&mut &buf[..n]).map_err(|e| anyhow!("Failed to parse: {e}"))?;
+                            parse_values(&mut &buf[..n])
+                            .map_err(|_| anyhow!("Failed to parse: {}", String::from_utf8_lossy(&buf[..n])))?;
 
                         let stream_tx = stream_tx.clone();
 
@@ -185,20 +240,19 @@ async fn process(
                         let is_replica_conn = Arc::clone(&is_replica_conn);
 
                         tokio::spawn(async move {
-                            if let RedisValue::Arr(_) = results {
-                                if let Err(e) = process_input(
-                                    results,
-                                    transaction_active,
-                                    transaction_queue,
-                                    db,
-                                    blocks,
-                                    streams,
-                                    stream_tx,
-                                    replica_tx,
-                                    is_replica_conn,
-                                ).await {
-                                    eprintln!("Error in processing task: {e}");
-                                }
+                            if let Err(e) = process_input(
+                                results,
+                                transaction_active,
+                                transaction_queue,
+                                db,
+                                blocks,
+                                streams,
+                                stream_tx,
+                                replica_tx,
+                                is_replica_conn,
+                                is_master_conn,
+                            ).await {
+                                eprintln!("Error in processing task: {e}");
                             }
                         });
 
@@ -226,7 +280,7 @@ async fn process(
 }
 
 async fn process_input(
-    results: RedisValue,
+    results: Vec<RedisValue>,
     transaction_active: Arc<Mutex<bool>>,
     transaction_queue: Arc<Mutex<VecDeque<VecDeque<RedisValue>>>>,
     db: Db,
@@ -235,56 +289,61 @@ async fn process_input(
     stream_tx: mpsc::Sender<Bytes>,
     replica_tx: broadcast::Sender<Bytes>,
     is_replica_conn: Arc<AtomicBool>,
+    is_master_conn: bool,
 ) -> anyhow::Result<()> {
-    if let RedisValue::Arr(mut v) = results {
-        let mut transaction_active = transaction_active.lock().await;
+    for result in results {
+        if let RedisValue::Arr(mut v) = result {
+            let mut transaction_active = transaction_active.lock().await;
 
-        if *transaction_active {
-            let mut transaction_queue = transaction_queue.lock().await;
+            if *transaction_active {
+                let mut transaction_queue = transaction_queue.lock().await;
 
-            match v[0].to_str() {
-                Some(s) if s.to_ascii_uppercase() == "EXEC" => {
-                    let resp = handle_exec(
-                        &mut transaction_queue,
-                        &db,
-                        &blocks,
-                        &streams,
-                        &mut transaction_active,
-                    )
+                match v[0].to_str() {
+                    Some(s) if s.to_ascii_uppercase() == "EXEC" => {
+                        let resp = handle_exec(
+                            &mut transaction_queue,
+                            &db,
+                            &blocks,
+                            &streams,
+                            &mut transaction_active,
+                        )
+                        .await?;
+                        stream_tx.send(resp).await?;
+                    }
+                    Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
+                        let resp = handle_discard(&mut transaction_queue, &mut transaction_active);
+                        stream_tx.send(resp).await?;
+                    }
+                    _ => {
+                        let resp = queue_command(&mut transaction_queue, v);
+                        stream_tx.send(resp).await?;
+                    }
+                }
+                // PSYNC sends two responses, so it needs special handling
+            } else if v[0].to_str().map(|s| s.to_ascii_uppercase()) == Some("PSYNC".to_string()) {
+                let resp = handle_psync()?;
+                stream_tx.send(resp).await?;
+
+                let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
+                let mut empty_rdb_resp = BytesMut::new();
+                empty_rdb_resp
+                    .extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
+                empty_rdb_resp.extend_from_slice(&empty_rdb_file);
+                stream_tx.send(empty_rdb_resp.freeze()).await?;
+
+                is_replica_conn.store(true, Ordering::Relaxed);
+            } else {
+                if GLOBAL_CONFIG.get().unwrap().instance_type == InstanceType::Master {
+                    if WRITE_COMMANDS.contains(&v[0].to_str().unwrap()) {
+                        replica_tx.send(vec_of_values_to_resp(&v))?;
+                    }
+                }
+                let resp = execute_command(&mut v, &db, &blocks, &streams, &mut transaction_active)
                     .await?;
-                    stream_tx.send(resp).await?;
-                }
-                Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
-                    let resp = handle_discard(&mut transaction_queue, &mut transaction_active);
-                    stream_tx.send(resp).await?;
-                }
-                _ => {
-                    let resp = queue_command(&mut transaction_queue, v);
+                if !is_master_conn {
                     stream_tx.send(resp).await?;
                 }
             }
-            // PSYNC sends two responses, so it needs special handling
-        } else if v[0].to_str().map(|s| s.to_ascii_uppercase()) == Some("PSYNC".to_string()) {
-            let resp = handle_psync()?;
-            stream_tx.send(resp).await?;
-
-            let empty_rdb_file = parse_hex_string(EMPTY_RDB_FILE)?;
-            let mut empty_rdb_resp = BytesMut::new();
-            empty_rdb_resp.extend_from_slice(format!("${}\r\n", empty_rdb_file.len()).as_bytes());
-            empty_rdb_resp.extend_from_slice(&empty_rdb_file);
-            stream_tx.send(empty_rdb_resp.freeze()).await?;
-
-            is_replica_conn.store(true, Ordering::Relaxed);
-        } else {
-            if GLOBAL_CONFIG.get().unwrap().instance_type == InstanceType::Master {
-                if WRITE_COMMANDS.contains(&v[0].to_str().unwrap()) {
-                    println!("Propagating");
-                    replica_tx.send(vec_of_values_to_resp(&v))?;
-                }
-            }
-            let resp =
-                execute_command(&mut v, &db, &blocks, &streams, &mut transaction_active).await?;
-            stream_tx.send(resp).await?;
         }
     }
 
@@ -333,27 +392,17 @@ async fn execute_command(
     }
 }
 
-async fn send_handshake() -> anyhow::Result<()> {
-    let global_config = GLOBAL_CONFIG.get().unwrap();
-    let slave_config = global_config.slave_config.as_ref().unwrap();
-
-    let mut stream = TcpStream::connect(format!(
-        "{}:{}",
-        slave_config.master_address.clone(),
-        slave_config.master_port
-    ))
-    .await?;
-
+async fn send_handshake(stream: &mut TcpStream) -> anyhow::Result<()> {
     stream.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
-    expect_response(&mut stream, b"+PONG\r\n").await?;
+    expect_response(stream, b"+PONG\r\n").await?;
     stream
         .write_all(b"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n")
         .await?;
-    expect_response(&mut stream, b"+OK\r\n").await?;
+    expect_response(stream, b"+OK\r\n").await?;
     stream
         .write_all(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
         .await?;
-    expect_response(&mut stream, b"+OK\r\n").await?;
+    expect_response(stream, b"+OK\r\n").await?;
     stream
         .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
         .await?;
