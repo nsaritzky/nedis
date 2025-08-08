@@ -186,7 +186,7 @@ async fn process(
     blocks: Blocks,
     streams: Streams,
     replica_tx: Sender<Bytes>,
-    is_master_conn: bool,
+    is_replication_conn: bool,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let transaction_active = Arc::new(Mutex::new(false));
@@ -251,7 +251,7 @@ async fn process(
                                 stream_tx,
                                 replica_tx,
                                 is_replica_conn,
-                                is_master_conn,
+                                is_replication_conn,
                             ).await {
                                 eprintln!("Error in processing task: {e}");
                             }
@@ -290,7 +290,7 @@ async fn process_input(
     stream_tx: mpsc::Sender<Bytes>,
     replica_tx: broadcast::Sender<Bytes>,
     is_replica_conn: Arc<AtomicBool>,
-    is_master_conn: bool,
+    is_replication_conn: bool,
 ) -> anyhow::Result<()> {
     for result in results {
         if let RedisValue::Arr(mut v) = result {
@@ -341,7 +341,20 @@ async fn process_input(
                 }
                 let resp = execute_command(&mut v, &db, &blocks, &streams, &mut transaction_active)
                     .await?;
-                if !is_master_conn {
+                if is_replication_conn {
+                    match (
+                        v.get(0).and_then(|val| val.to_str()),
+                        v.get(1).and_then(|val| val.to_str()),
+                    ) {
+                        (Some(a), Some(b))
+                            if a.to_ascii_uppercase() == "REPLCONF"
+                                && b.to_ascii_uppercase() == "GETACK" =>
+                        {
+                            stream_tx.send(resp).await?
+                        }
+                        _ => {}
+                    }
+                } else {
                     stream_tx.send(resp).await?;
                 }
             }
@@ -383,7 +396,7 @@ async fn execute_command(
             "INFO" => handle_info(v),
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
-            "REPLCONF" => Ok("+OK\r\n".into()),
+            "REPLCONF" => handle_replconf(v),
             _ => {
                 bail!("Invalid command")
             }
@@ -1169,9 +1182,16 @@ fn handle_psync() -> anyhow::Result<Bytes> {
     Ok(format!("+FULLRESYNC {} 0\r\n", master_config.replication_id).into())
 }
 
-async fn send_response(socket: &mut TcpStream, resp: &[u8]) -> anyhow::Result<()> {
-    socket.write_all(resp).await?;
-    socket.flush().await.map_err(|e| anyhow!(e))
+fn handle_replconf(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
+    if let Some(s) = v.get(1).and_then(|val| val.to_str()) {
+        if s.to_ascii_uppercase() == "GETACK" {
+            Ok("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n".into())
+        } else {
+            Ok("+OK\r\n".into())
+        }
+    } else {
+        Ok("+OK\r\n".into())
+    }
 }
 
 fn gather_stream_read_results(
