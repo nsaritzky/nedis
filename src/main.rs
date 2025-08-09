@@ -47,6 +47,7 @@ const WRITE_COMMANDS: [&str; 7] = ["SET", "DEL", "RPUSH", "LPOP", "BLPOP", "XADD
 type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
 type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
+type TransactionQueue = Arc<Mutex<VecDeque<(VecDeque<RedisValue>, usize)>>>;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum InstanceType {
@@ -128,6 +129,13 @@ async fn main() -> anyhow::Result<()> {
     let loop_blocks = Arc::clone(&blocks);
     let loop_streams = Arc::clone(&streams);
     let loop_replica_tx = replica_tx.clone();
+    let replica_count = if !is_replica {
+        Some(Arc::new(AtomicUsize::new(0)))
+    } else {
+        None
+    };
+
+    let loop_replica_count = replica_count.clone();
 
     let server_handle = tokio::spawn(async move {
         loop {
@@ -137,13 +145,23 @@ async fn main() -> anyhow::Result<()> {
             let db = Arc::clone(&loop_db);
             let blocks = Arc::clone(&loop_blocks);
             let streams = Arc::clone(&loop_streams);
+            let process_replica_count = loop_replica_count.clone();
 
             let replica_tx = loop_replica_tx.clone();
 
             tokio::spawn(async move {
-                process(socket, db, blocks, streams, replica_tx, false)
-                    .await
-                    .expect("Process should be successful");
+                process(
+                    socket,
+                    db,
+                    blocks,
+                    streams,
+                    replica_tx,
+                    false,
+                    !is_replica,
+                    process_replica_count,
+                )
+                .await
+                .expect("Process should be successful");
             });
         }
     });
@@ -172,6 +190,8 @@ async fn main() -> anyhow::Result<()> {
                 replica_streams,
                 replica_tx,
                 true,
+                false,
+                None,
             )
             .await
             .expect("Master connection process should be successful");
@@ -179,6 +199,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     server_handle.await?;
+
+    replica_count.map(|rc| rc.fetch_sub(1, Ordering::Relaxed));
 
     Ok(())
 }
@@ -190,10 +212,12 @@ async fn process(
     streams: Streams,
     replica_tx: Sender<Bytes>,
     is_replication_conn: bool,
+    is_master: bool,
+    replica_count: Option<Arc<AtomicUsize>>,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let transaction_active = Arc::new(Mutex::new(false));
-    let transaction_queue = Arc::new(Mutex::new(VecDeque::<(VecDeque<RedisValue>, usize)>::new()));
+    let transaction_queue: TransactionQueue = Arc::new(Mutex::new(VecDeque::new()));
 
     let mut replica_receiver = replica_tx.subscribe();
     let is_replica_conn = Arc::new(AtomicBool::new(false));
@@ -222,9 +246,6 @@ async fn process(
                                 let _ = buf.split_to(EMPTY_RDB_BYTES.len());
                                 println!("Received RDB file; resetting replica offset");
                                 replica_offset.store(0, Ordering::SeqCst);
-                                // if buf.len() == 0 {
-                                //     continue;
-                                // }
                             }
                         let results = parse_values_with_len(&mut &buf[..])
                             .map_err(|e| anyhow!(e))?;
@@ -239,6 +260,7 @@ async fn process(
                         let replica_tx = replica_tx.clone();
                         let is_replica_conn = Arc::clone(&is_replica_conn);
                         let process_replica_offset = Arc::clone(&replica_offset);
+                        let replica_count = replica_count.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = process_input(
@@ -253,6 +275,7 @@ async fn process(
                                 is_replica_conn,
                                 is_replication_conn,
                                 process_replica_offset,
+                                replica_count,
                             ).await {
                                 eprintln!("Error in processing task: {e}");
                             }
@@ -283,7 +306,7 @@ async fn process(
 async fn process_input(
     results: Vec<(RedisValue, usize)>,
     transaction_active: Arc<Mutex<bool>>,
-    transaction_queue: Arc<Mutex<VecDeque<(VecDeque<RedisValue>, usize)>>>,
+    transaction_queue: TransactionQueue,
     db: Db,
     blocks: Blocks,
     streams: Streams,
@@ -292,6 +315,7 @@ async fn process_input(
     is_replica_conn: Arc<AtomicBool>,
     is_replication_conn: bool,
     replica_offset: Arc<AtomicUsize>,
+    replica_count: Option<Arc<AtomicUsize>>,
 ) -> anyhow::Result<()> {
     for (result, message_len) in results {
         if let RedisValue::Arr(mut v) = result {
@@ -309,6 +333,7 @@ async fn process_input(
                             &streams,
                             &mut transaction_active,
                             Arc::clone(&replica_offset),
+                            replica_count.clone(),
                         )
                         .await?;
                         stream_tx.send(resp).await?;
@@ -328,6 +353,9 @@ async fn process_input(
                 stream_tx.send(resp).await?;
                 stream_tx.send(EMPTY_RDB_BYTES.clone()).await?;
 
+                replica_count
+                    .as_ref()
+                    .map(|rc| rc.fetch_add(1, Ordering::Relaxed));
                 is_replica_conn.store(true, Ordering::Relaxed);
             } else {
                 replica_offset.fetch_add(message_len, Ordering::SeqCst);
@@ -345,6 +373,7 @@ async fn process_input(
                     &mut transaction_active,
                     Arc::clone(&replica_offset),
                     message_len,
+                    replica_count.clone(),
                 )
                 .await?;
 
@@ -383,6 +412,7 @@ async fn execute_command(
     transaction_active: &mut bool,
     replica_offset: Arc<AtomicUsize>,
     message_len: usize,
+    replica_count: Option<Arc<AtomicUsize>>,
 ) -> anyhow::Result<Bytes> {
     let mut i = 0;
 
@@ -411,7 +441,7 @@ async fn execute_command(
             "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
             "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
             "REPLCONF" => handle_replconf(v, replica_offset, message_len),
-            "WAIT" => handle_wait(),
+            "WAIT" => handle_wait(v, replica_count).await,
             _ => {
                 bail!("Invalid command")
             }
@@ -1139,6 +1169,7 @@ async fn handle_exec(
     streams: &Streams,
     transaction_active: &mut bool,
     replica_offset: Arc<AtomicUsize>,
+    replica_count: Option<Arc<AtomicUsize>>,
 ) -> anyhow::Result<Bytes> {
     let mut buf = BytesMut::new();
 
@@ -1153,6 +1184,7 @@ async fn handle_exec(
             transaction_active,
             Arc::clone(&replica_offset),
             *message_len,
+            replica_count.clone(),
         )
         .await?;
         buf.put_slice(&resp);
@@ -1230,8 +1262,38 @@ fn handle_replconf(
     }
 }
 
-fn handle_wait() -> anyhow::Result<Bytes> {
-    Ok(":0\r\n".into())
+async fn handle_wait(
+    v: &mut VecDeque<RedisValue>,
+    replica_count: Option<Arc<AtomicUsize>>,
+) -> anyhow::Result<Bytes> {
+    if let Some(replica_count) = replica_count {
+        let n = v
+            .get(1)
+            .and_then(|val| val.to_str())
+            .and_then(|s| s.parse::<usize>().ok())
+            .expect("WAIT: Invalid replica count");
+        let timeout = v
+            .get(2)
+            .and_then(|val| val.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("WAIT: Invalid timeout");
+
+        let expires = SystemTime::now()
+            .checked_add(Duration::from_millis(timeout))
+            .expect("WAIT: Invalid expiration");
+
+        let mut interval = interval(Duration::from_millis(10));
+
+        loop {
+            interval.tick().await;
+            let rc = replica_count.load(Ordering::Relaxed);
+
+            if expires < SystemTime::now() || n <= rc {
+                return Ok(format!(":{}\r\n", rc).into());
+            }
+        }
+    }
+    bail!("Called WAIT on a replica");
 }
 
 fn gather_stream_read_results(
