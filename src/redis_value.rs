@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     collections::{HashMap, VecDeque},
 };
 
@@ -173,11 +172,11 @@ impl From<VecDeque<RedisValue>> for RedisValue {
 #[derive(Debug)]
 pub struct StreamElement {
     pub id: String,
-    pub value: HashMap<PrimitiveRedisValue, RedisValue>,
+    pub value: HashMap<String, String>,
 }
 
 impl StreamElement {
-    pub fn new(id: String, value: HashMap<PrimitiveRedisValue, RedisValue>) -> Self {
+    pub fn new(id: String, value: HashMap<String, String>) -> Self {
         StreamElement { id, value }
     }
 }

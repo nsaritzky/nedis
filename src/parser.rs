@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     collections::{HashMap, VecDeque},
     str::FromStr,
@@ -10,9 +12,26 @@ use winnow::{
     combinator::{
         alt, delimited, dispatch, fail, opt, preceded, repeat, separated_pair, terminated,
     },
+    error::ParserError,
+    stream::{SliceLen, Stream},
     token::{any, one_of, take, take_until},
     Parser, Result,
 };
+
+pub fn parse_multiple_resp_arrays_of_strings_with_len(
+    input: &mut &[u8],
+) -> Result<Vec<(Vec<String>, usize)>> {
+    repeat(0.., parse_with_len(parse_resp_array_of_strings)).parse_next(input)
+}
+
+pub fn parse_resp_array_of_strings(input: &mut &[u8]) -> Result<Vec<String>> {
+    dispatch! {any;
+               b'+' => parse_simple_string.map(|res| vec![res]),
+               b'*' => terminated(dec_uint, crlf).flat_map(|n: usize| repeat(n, preceded("$", parse_bulk_string))),
+               _ => fail::<_, Vec<String>, _>
+    }
+    .parse_next(input)
+}
 
 pub fn parse_values_with_len(input: &mut &[u8]) -> Result<Vec<(RedisValue, usize)>> {
     repeat(0.., parse_value_with_len).parse_next(input)
@@ -45,6 +64,21 @@ pub fn parse_value<'a>(input: &mut &'a [u8]) -> Result<RedisValue> {
             _ => fail::<_, RedisValue, _>
     }
     .parse_next(input)
+}
+
+fn parse_with_len<Input, Output, Error, ParseNext>(
+    mut parser: ParseNext,
+) -> impl Parser<Input, (Output, usize), Error>
+where
+    Input: Stream + SliceLen,
+    Error: ParserError<Input>,
+    ParseNext: Parser<Input, Output, Error>,
+{
+    move |input: &mut Input| {
+        let length_before = input.slice_len();
+        let result = parser.parse_next(input)?;
+        Ok((result, length_before - input.slice_len()))
+    }
 }
 
 fn parse_bulk_string<'a>(input: &mut &'a [u8]) -> Result<String> {

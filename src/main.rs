@@ -1,15 +1,17 @@
 mod args;
+mod db_value;
 mod hex;
 mod parser;
 mod redis_value;
+mod replica_tracker;
+mod response;
+mod state;
 
 use std::{
-    collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
+    collections::{hash_map::Entry, BTreeSet, VecDeque},
     fmt::{self, Display, Formatter},
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, LazyLock, OnceLock,
-    },
+    future,
+    sync::{LazyLock, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,9 +21,13 @@ use crate::parser::*;
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
+use db_value::{DbValue, StreamElement};
+use indexmap::IndexMap;
 use itertools::Itertools;
 use num::ToPrimitive;
-use redis_value::{PrimitiveRedisValue, RedisValue, StreamElement};
+use redis_value::{PrimitiveRedisValue, RedisValue};
+use response::RedisResponse;
+use state::{ConnectionState, ConnectionType, ServerState};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -29,10 +35,7 @@ use tokio::{
     sync::{broadcast::error::RecvError, mpsc, Mutex},
     time::interval,
 };
-use tokio::{
-    sync::broadcast::{self, Sender},
-    task,
-};
+use tokio::{sync::broadcast, task};
 
 const EMPTY_RDB_FILE: &str = include_str!("../resources/empty_rdb.hex");
 const EMPTY_RDB_BYTES: LazyLock<Bytes> = LazyLock::new(|| {
@@ -43,11 +46,6 @@ const EMPTY_RDB_BYTES: LazyLock<Bytes> = LazyLock::new(|| {
     res.freeze()
 });
 const WRITE_COMMANDS: [&str; 7] = ["SET", "DEL", "RPUSH", "LPOP", "BLPOP", "XADD", "INCR"];
-
-type Db = Arc<Mutex<HashMap<PrimitiveRedisValue, (RedisValue, Option<SystemTime>)>>>;
-type Blocks = Arc<Mutex<HashMap<PrimitiveRedisValue, BTreeSet<(SystemTime, String)>>>>;
-type Streams = Arc<Mutex<HashMap<PrimitiveRedisValue, Vec<StreamElement>>>>;
-type TransactionQueue = Arc<Mutex<VecDeque<(VecDeque<RedisValue>, usize)>>>;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum InstanceType {
@@ -92,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .unwrap();
 
-    let is_replica = args.replicaof.is_some();
+    let is_master = args.replicaof.is_none();
 
     GLOBAL_CONFIG
         .set(if args.replicaof.is_some() {
@@ -119,60 +117,49 @@ async fn main() -> anyhow::Result<()> {
         })
         .map_err(|_| anyhow!("Failed to set instance type"))?;
 
-    let db: Db = Arc::new(Mutex::new(HashMap::new()));
-    let blocks: Blocks = Arc::new(Mutex::new(HashMap::new()));
-    let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
-
     let (replica_tx, _) = broadcast::channel::<Bytes>(32);
 
-    let loop_db = Arc::clone(&db);
-    let loop_blocks = Arc::clone(&blocks);
-    let loop_streams = Arc::clone(&streams);
-    let loop_replica_tx = replica_tx.clone();
-    let replica_count = if !is_replica {
-        Some(Arc::new(AtomicUsize::new(0)))
-    } else {
-        None
-    };
-
-    let loop_replica_count = replica_count.clone();
+    let server_state = ServerState::new(
+        is_master,
+        if is_master {
+            Some(replica_tx.clone())
+        } else {
+            None
+        },
+    );
+    let loop_server_state = server_state.clone();
 
     let server_handle = tokio::spawn(async move {
         loop {
             let (socket, addr) = listener.accept().await.unwrap();
             println!("Accepting connection from {addr}");
 
-            let db = Arc::clone(&loop_db);
-            let blocks = Arc::clone(&loop_blocks);
-            let streams = Arc::clone(&loop_streams);
-            let process_replica_count = loop_replica_count.clone();
-
-            let replica_tx = loop_replica_tx.clone();
+            let server_state = loop_server_state.clone();
 
             tokio::spawn(async move {
-                process(
-                    socket,
-                    db,
-                    blocks,
-                    streams,
-                    replica_tx,
-                    false,
-                    !is_replica,
-                    process_replica_count,
-                )
-                .await
-                .expect("Process should be successful");
+                process(socket, false, server_state)
+                    .await
+                    .expect("Process should be successful");
             });
         }
     });
 
-    if is_replica {
+    if is_master {
+        let mut interval = interval(Duration::from_secs(1));
+
+        tokio::spawn(async move {
+            loop {
+                interval.tick().await;
+
+                if let Err(_) = send_getack(server_state.clone()) {
+                    println!("Failed to send heartbeat request");
+                    break;
+                }
+            }
+        });
+    } else {
         let global_config = GLOBAL_CONFIG.get().unwrap();
         let slave_config = global_config.slave_config.as_ref().unwrap();
-
-        let replica_db = Arc::clone(&db);
-        let replica_blocks = Arc::clone(&blocks);
-        let replica_streams = Arc::clone(&streams);
 
         let mut master_stream = TcpStream::connect(format!(
             "{}:{}",
@@ -183,53 +170,45 @@ async fn main() -> anyhow::Result<()> {
         send_handshake(&mut master_stream).await?;
 
         tokio::spawn(async move {
-            process(
-                master_stream,
-                replica_db,
-                replica_blocks,
-                replica_streams,
-                replica_tx,
-                true,
-                false,
-                None,
-            )
-            .await
-            .expect("Master connection process should be successful");
+            process(master_stream, true, server_state)
+                .await
+                .expect("Master connection process should be successful");
         });
     }
 
     server_handle.await?;
-
-    replica_count.map(|rc| rc.fetch_sub(1, Ordering::Relaxed));
 
     Ok(())
 }
 
 async fn process(
     stream: TcpStream,
-    db: Db,
-    blocks: Blocks,
-    streams: Streams,
-    replica_tx: Sender<Bytes>,
     is_replication_conn: bool,
-    is_master: bool,
-    replica_count: Option<Arc<AtomicUsize>>,
+    mut server_state: ServerState,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
-    let transaction_active = Arc::new(Mutex::new(false));
-    let transaction_queue: TransactionQueue = Arc::new(Mutex::new(VecDeque::new()));
 
-    let mut replica_receiver = replica_tx.subscribe();
-    let is_replica_conn = Arc::new(AtomicBool::new(false));
-    let replica_offset = Arc::new(AtomicUsize::new(0));
+    let mut replica_receiver = server_state
+        .master_state()
+        .map(|ms| ms.replica_tx.subscribe());
 
     let (mut stream_reader, mut stream_writer) = stream.into_split();
     let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(100);
 
+    let mut connection_state = ConnectionState::new(stream_tx.clone(), server_state.is_master());
+    if is_replication_conn {
+        connection_state.set_connection_type(ConnectionType::ReplicaToMaster);
+    }
+
     let writer = tokio::spawn(async move {
         while let Some(msg) = stream_rx.recv().await {
+            println!("Sending msg: {}", String::from_utf8_lossy(&msg));
             if let Err(e) = stream_writer.write_all(&msg).await {
-                eprintln!("Stream write error: {e}");
+                println!("Stream write error: {e}");
+                break;
+            }
+            if let Err(e) = stream_writer.flush().await {
+                println!("Stream flush error: {e}");
                 break;
             }
         }
@@ -244,38 +223,20 @@ async fn process(
                         if n >= EMPTY_RDB_BYTES.len() &&
                             (buf[..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES) {
                                 let _ = buf.split_to(EMPTY_RDB_BYTES.len());
-                                println!("Received RDB file; resetting replica offset");
-                                replica_offset.store(0, Ordering::SeqCst);
+                                println!("Received RDB file; resetting offset");
+                                server_state.init_offset();
                             }
-                        let results = parse_values_with_len(&mut &buf[..])
+                        let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
                             .map_err(|e| anyhow!(e))?;
 
-                        let stream_tx = stream_tx.clone();
-
-                        let transaction_active = Arc::clone(&transaction_active);
-                        let transaction_queue = Arc::clone(&transaction_queue);
-                        let db = Arc::clone(&db);
-                        let blocks = Arc::clone(&blocks);
-                        let streams = Arc::clone(&streams);
-                        let replica_tx = replica_tx.clone();
-                        let is_replica_conn = Arc::clone(&is_replica_conn);
-                        let process_replica_offset = Arc::clone(&replica_offset);
-                        let replica_count = replica_count.clone();
+                        let server_state = server_state.clone();
+                        let connection_state = connection_state.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = process_input(
                                 results,
-                                transaction_active,
-                                transaction_queue,
-                                db,
-                                blocks,
-                                streams,
-                                stream_tx,
-                                replica_tx,
-                                is_replica_conn,
-                                is_replication_conn,
-                                process_replica_offset,
-                                replica_count,
+                                server_state,
+                                connection_state,
                             ).await {
                                 eprintln!("Error in processing task: {e}");
                             }
@@ -287,8 +248,8 @@ async fn process(
                 }
             }
 
-            msg = replica_receiver.recv() => {
-                if is_replica_conn.load(Ordering::Relaxed) {
+            msg = receive_if(&mut replica_receiver) => {
+                if connection_state.get_connection_type() == ConnectionType::MasterToReplica {
                     match msg {
                         Ok(msg) => stream_tx.send(msg).await?,
                         Err(RecvError::Closed) => break,
@@ -304,84 +265,54 @@ async fn process(
 }
 
 async fn process_input(
-    results: Vec<(RedisValue, usize)>,
-    transaction_active: Arc<Mutex<bool>>,
-    transaction_queue: TransactionQueue,
-    db: Db,
-    blocks: Blocks,
-    streams: Streams,
-    stream_tx: mpsc::Sender<Bytes>,
-    replica_tx: broadcast::Sender<Bytes>,
-    is_replica_conn: Arc<AtomicBool>,
-    is_replication_conn: bool,
-    replica_offset: Arc<AtomicUsize>,
-    replica_count: Option<Arc<AtomicUsize>>,
+    results: Vec<(Vec<String>, usize)>,
+    mut server_state: ServerState,
+    connection_state: ConnectionState,
 ) -> anyhow::Result<()> {
-    for (result, message_len) in results {
-        if let RedisValue::Arr(mut v) = result {
-            let mut transaction_active = transaction_active.lock().await;
-
-            if *transaction_active {
-                let mut transaction_queue = transaction_queue.lock().await;
-
-                match v[0].to_str() {
-                    Some(s) if s.to_ascii_uppercase() == "EXEC" => {
-                        let resp = handle_exec(
-                            &mut transaction_queue,
-                            &db,
-                            &blocks,
-                            &streams,
-                            &mut transaction_active,
-                            Arc::clone(&replica_offset),
-                            replica_count.clone(),
-                        )
-                        .await?;
-                        stream_tx.send(resp).await?;
-                    }
-                    Some(s) if s.to_ascii_uppercase() == "DISCARD" => {
-                        let resp = handle_discard(&mut transaction_queue, &mut transaction_active);
-                        stream_tx.send(resp).await?;
-                    }
-                    _ => {
-                        let resp = queue_command(&mut transaction_queue, message_len, v);
-                        stream_tx.send(resp).await?;
+    let commands_nonempty = !results.is_empty();
+    for (mut v, message_len) in results {
+        if connection_state.get_transaction_active() {
+            match v[0].to_ascii_uppercase().as_str() {
+                "EXEC" => {
+                    let responses =
+                        handle_exec(server_state.clone(), connection_state.clone()).await?;
+                    for resp in responses {
+                        connection_state.stream_tx.send(resp).await?;
                     }
                 }
-                // PSYNC sends two responses, so it needs special handling
-            } else if v[0].to_str().map(|s| s.to_ascii_uppercase()) == Some("PSYNC".to_string()) {
-                let resp = handle_psync()?;
-                stream_tx.send(resp).await?;
-                stream_tx.send(EMPTY_RDB_BYTES.clone()).await?;
-
-                replica_count
-                    .as_ref()
-                    .map(|rc| rc.fetch_add(1, Ordering::Relaxed));
-                is_replica_conn.store(true, Ordering::Relaxed);
-            } else {
-                replica_offset.fetch_add(message_len, Ordering::SeqCst);
-
-                if GLOBAL_CONFIG.get().unwrap().instance_type == InstanceType::Master {
-                    if WRITE_COMMANDS.contains(&v[0].to_str().unwrap()) {
-                        replica_tx.send(vec_of_values_to_resp(&v))?;
+                "DISCARD" => {
+                    for resp in handle_discard(connection_state.clone()).await {
+                        connection_state.stream_tx.send(resp).await?;
                     }
                 }
-                let resp = execute_command(
-                    &mut v,
-                    &db,
-                    &blocks,
-                    &streams,
-                    &mut transaction_active,
-                    Arc::clone(&replica_offset),
-                    message_len,
-                    replica_count.clone(),
-                )
-                .await?;
+                _ => {
+                    for resp in queue_command(connection_state.clone(), message_len, v).await {
+                        connection_state.stream_tx.send(resp).await?;
+                    }
+                }
+            }
+        } else {
+            if let Some(master_state) = server_state.master_state() {
+                if WRITE_COMMANDS.contains(&v[0].as_str()) {
+                    master_state.add_to_offset(message_len);
+                    master_state
+                        .broadcast_to_replicas(RedisResponse::from_str_vec(&v).to_bytes())?;
+                }
+            } else if !v[0].to_ascii_uppercase().starts_with("FULLRESYNC") {
+                server_state.add_to_replica_offset(message_len)?;
+            }
 
-                let should_send_response = if is_replication_conn {
-                    match (
-                        v.get(0).and_then(|val| val.to_str()),
-                        v.get(1).and_then(|val| val.to_str()),
-                    ) {
+            let responses = execute_command(
+                &mut v,
+                message_len,
+                server_state.clone(),
+                connection_state.clone(),
+            )
+            .await?;
+
+            let should_send_response =
+                if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster {
+                    match (v.get(0), v.get(1)) {
                         (Some(a), Some(b))
                             if a.to_ascii_uppercase() == "REPLCONF"
                                 && b.to_ascii_uppercase() == "GETACK" =>
@@ -394,60 +325,58 @@ async fn process_input(
                     true
                 };
 
-                if should_send_response {
-                    stream_tx.send(resp).await?;
+            if should_send_response {
+                for resp in responses {
+                    connection_state.stream_tx.send(resp).await?;
                 }
             }
         }
     }
 
+    // if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster
+    //     && commands_nonempty
+    // {
+    //     send_ack(server_state, connection_state).await?;
+    // }
+
     Ok(())
 }
 
 async fn execute_command(
-    v: &mut VecDeque<RedisValue>,
-    db: &Db,
-    blocks: &Blocks,
-    streams: &Streams,
-    transaction_active: &mut bool,
-    replica_offset: Arc<AtomicUsize>,
+    v: &mut Vec<String>,
     message_len: usize,
-    replica_count: Option<Arc<AtomicUsize>>,
-) -> anyhow::Result<Bytes> {
+    server_state: ServerState,
+    connection_state: ConnectionState,
+) -> anyhow::Result<Vec<Bytes>> {
+    println!("Command: {}", v[0]);
     let mut i = 0;
-
-    if let RedisValue::Primitive(PrimitiveRedisValue::Str(s)) = &v[i] {
-        match s.to_ascii_uppercase().as_str() {
-            "PING" => Ok("+PONG\r\n".into()),
-            "ECHO" => {
-                i += 1;
-                Ok(v[i].to_bytes())
-            }
-            "SET" => handle_set(&db, v, &mut i).await,
-            "GET" => handle_get(&db, v, &mut i).await,
-            "RPUSH" => handle_rpush(&db, v, &mut i).await,
-            "LRANGE" => handle_lrange(&db, v, &mut i).await,
-            "LPUSH" => handle_lpush(&db, v, &mut i).await,
-            "LLEN" => handle_llen(&db, v, &mut i).await,
-            "LPOP" => handle_lpop(&db, v, &mut i).await,
-            "BLPOP" => handle_blpop(&db, &blocks, v, &mut i).await,
-            "TYPE" => handle_type(&db, &streams, v, &mut i).await,
-            "XADD" => handle_xadd(&streams, v, &mut i).await,
-            "XRANGE" => handle_xrange(&streams, v, &mut i).await,
-            "XREAD" => handle_xread(&streams, v, &mut i).await,
-            "INCR" => handle_incr(&db, v, &mut i).await,
-            "MULTI" => handle_multi(transaction_active).await,
-            "INFO" => handle_info(v),
-            "EXEC" => Ok("-ERR EXEC without MULTI\r\n".into()),
-            "DISCARD" => Ok("-ERR DISCARD without MULTI\r\n".into()),
-            "REPLCONF" => handle_replconf(v, replica_offset, message_len),
-            "WAIT" => handle_wait(v, replica_count).await,
-            _ => {
-                bail!("Invalid command")
-            }
+    match v[0].to_ascii_uppercase().as_str() {
+        "PING" => Ok(vec!["+PONG\r\n".into()]),
+        "ECHO" => Ok(vec![bulk_string(&v[1])]),
+        "SET" => handle_set(server_state, v).await,
+        "GET" => handle_get(server_state, v).await,
+        "RPUSH" => handle_rpush(server_state, v, &mut i).await,
+        "LRANGE" => handle_lrange(server_state, v, &mut i).await,
+        "LPUSH" => handle_lpush(server_state, v, &mut i).await,
+        "LLEN" => handle_llen(server_state, v, &mut i).await,
+        "LPOP" => handle_lpop(server_state, v, &mut i).await,
+        "BLPOP" => handle_blpop(server_state, v, &mut i).await,
+        "TYPE" => handle_type(server_state, v, &mut i).await,
+        "XADD" => handle_xadd(server_state, v, &mut i).await,
+        "XRANGE" => handle_xrange(server_state, v, &mut i).await,
+        "XREAD" => handle_xread(server_state, v, &mut i).await,
+        "INCR" => handle_incr(server_state, v, &mut i).await,
+        "MULTI" => handle_multi(connection_state).await,
+        "INFO" => handle_info(v),
+        "EXEC" => Ok(vec!["-ERR EXEC without MULTI\r\n".into()]),
+        "DISCARD" => Ok(vec!["-ERR DISCARD without MULTI\r\n".into()]),
+        "REPLCONF" => handle_replconf(v, message_len, server_state, connection_state).await,
+        "WAIT" => handle_wait(v, server_state).await,
+        "PSYNC" => handle_psync(server_state, connection_state).await,
+        s if s.starts_with("FULLRESYNC") => Ok(vec![]),
+        _ => {
+            bail!("Invalid command")
         }
-    } else {
-        bail!("Invalid arg");
     }
 }
 
@@ -485,101 +414,82 @@ async fn expect_response(stream: &mut TcpStream, expected_response: &[u8]) -> an
     }
 }
 
-async fn handle_set(db: &Db, v: &mut VecDeque<RedisValue>, i: &mut usize) -> anyhow::Result<Bytes> {
+async fn handle_set(server_state: ServerState, v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
     let (key, value) = {
-        let mut iter = v.drain(*i + 1..*i + 3);
+        let mut iter = v.drain(1..3);
         (iter.next(), iter.next())
     };
 
-    if let Some(RedisValue::Primitive(k)) = key {
-        if let Some(value) = value {
-            let mut db = db.lock().await;
+    if let (Some(key), Some(value)) = (key, value) {
+        let mut db = server_state.db.lock().await;
 
-            *i += 1;
-            match v.get(*i) {
-                Some(RedisValue::Primitive(PrimitiveRedisValue::Str(s)))
-                    if s.to_ascii_uppercase() == "PX" =>
-                {
-                    *i += 1;
+        match v.get(1) {
+            Some(s) if s.to_ascii_uppercase() == "PX" => {
+                let expires_in: u64 = v[2].parse()?;
 
-                    if let RedisValue::Primitive(PrimitiveRedisValue::Str(t)) = &v[*i] {
-                        let expires_in: u64 = t.parse()?;
+                let current_time = SystemTime::now();
+                let expires = current_time
+                    .checked_add(Duration::from_millis(expires_in))
+                    .ok_or(anyhow!("SET: Invalid expires durartion"))?;
 
-                        let current_time = SystemTime::now();
-                        let expires = current_time
-                            .checked_add(Duration::from_millis(expires_in))
-                            .ok_or(anyhow!("Invalid expires durartion"))?;
-
-                        db.insert(k, (value, Some(expires)));
-                    }
-                }
-                _ => {
-                    db.insert(k, (value, None));
-                }
+                db.insert(key, (DbValue::String(value), Some(expires)));
             }
-            Ok("+OK\r\n".into())
-        } else {
-            bail!("SET: no value found")
+            _ => {
+                db.insert(key, (DbValue::String(value), None));
+            }
         }
+        Ok(vec!["+OK\r\n".into()])
     } else {
-        bail!("SET: bad key")
+        bail!("SET: bad key or value")
     }
 }
 
-async fn handle_get(db: &Db, v: &mut VecDeque<RedisValue>, i: &mut usize) -> anyhow::Result<Bytes> {
-    *i += 1;
+async fn handle_get(server_state: ServerState, v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+    let key = &v[1];
 
-    if let RedisValue::Primitive(key) = &v[*i] {
-        let mut db = db.lock().await;
+    let mut db = server_state.db.lock().await;
 
-        if let Some((value, expiry)) = db.get(key) {
-            if let Some(expiry) = expiry {
-                if *expiry < SystemTime::now() {
-                    db.remove(key);
-                    Ok("$-1\r\n".into())
-                } else {
-                    Ok(value.to_bytes())
-                }
+    if let Some((value, expiry)) = db.get(key) {
+        if let Some(expiry) = expiry {
+            if *expiry < SystemTime::now() {
+                db.remove(key);
+                Ok(vec!["$-1\r\n".into()])
             } else {
-                Ok(value.to_bytes())
+                Ok(vec![RedisResponse::from(value).to_bytes()])
             }
         } else {
-            Ok("$-1\r\n".into())
+            Ok(vec![RedisResponse::from(value).to_bytes()])
         }
     } else {
-        bail!(
-            "Invalid key type: {}",
-            String::from_utf8_lossy(&v[*i].to_bytes())
-        );
+        Ok(vec!["$-1\r\n".into()])
     }
 }
 
 async fn handle_rpush(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
-    let (key, mut values) = {
+) -> anyhow::Result<Vec<Bytes>> {
+    let (key, values) = {
         let mut drain = v.drain(*i + 1..);
-        (drain.next(), drain.collect::<VecDeque<_>>())
+        (drain.next(), drain.collect::<Vec<_>>())
     };
 
-    if let Some(RedisValue::Primitive(key)) = key {
-        let mut db = db.lock().await;
+    if let Some(key) = key {
+        let mut db = server_state.db.lock().await;
 
-        if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
-            array.append(&mut values);
+        if let Some((DbValue::List(ref mut array), _)) = db.get_mut(&key) {
+            array.append(&mut values.into());
 
-            let resp =
-                RedisValue::Primitive(PrimitiveRedisValue::Int(array.len().to_isize().unwrap()));
-            Ok(resp.to_bytes())
+            let resp = RedisResponse::Int(array.len().to_isize().unwrap());
+            Ok(vec![resp.to_bytes()])
         } else {
             let size = values.len().to_isize().unwrap();
 
-            db.insert(key, (RedisValue::Arr(values), None));
+            db.insert(key, (DbValue::List(values.into()), None));
 
-            let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
-            Ok(resp.to_bytes())
+            let resp = RedisResponse::Int(size);
+            Ok(vec![resp.to_bytes()])
         }
     } else {
         bail!("Bad key: {key:?}");
@@ -587,299 +497,289 @@ async fn handle_rpush(
 }
 
 async fn handle_lrange(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
-    let empty_array_response = RedisValue::Arr(VecDeque::new()).to_bytes();
+    let empty_array_response = RedisResponse::List(vec![]).to_bytes();
+    let key = &v[*i];
 
-    if let RedisValue::Primitive(key) = &v[*i] {
-        let db = db.lock().await;
+    let db = server_state.db.lock().await;
 
-        if let Some((RedisValue::Arr(array), _)) = db.get(key) {
-            if let (
-                Some(RedisValue::Primitive(PrimitiveRedisValue::Str(a))),
-                Some(RedisValue::Primitive(PrimitiveRedisValue::Str(b))),
-            ) = (v.get(*i + 1), v.get(*i + 2))
-            {
-                let a: isize = a.parse()?;
-                let a: usize = if a >= 0 {
-                    a.to_usize().unwrap()
-                } else {
-                    array.len().checked_add_signed(a).unwrap_or(0)
-                };
-                let b: isize = b.parse()?;
-                let b: usize = if b >= 0 {
-                    b.to_usize().unwrap()
-                } else {
-                    array.len().checked_add_signed(b).unwrap_or(0)
-                };
-
-                if a >= array.len() {
-                    Ok(empty_array_response)
-                } else if b > array.len() - 1 {
-                    let resp = RedisValue::Arr(array.range(a..).cloned().collect());
-                    Ok(resp.to_bytes())
-                } else {
-                    let resp = RedisValue::Arr(array.range(a..=b).cloned().collect());
-                    Ok(resp.to_bytes())
-                }
+    if let Some((DbValue::List(array), _)) = db.get(key) {
+        if let (Some(a), Some(b)) = (v.get(*i + 1), v.get(*i + 2)) {
+            let a: isize = a.parse()?;
+            let a: usize = if a >= 0 {
+                a.to_usize().unwrap()
             } else {
-                bail!("Failed to get array bounds");
+                array.len().checked_add_signed(a).unwrap_or(0)
+            };
+            let b: isize = b.parse()?;
+            let b: usize = if b >= 0 {
+                b.to_usize().unwrap()
+            } else {
+                array.len().checked_add_signed(b).unwrap_or(0)
+            };
+
+            if a >= array.len() {
+                Ok(vec![empty_array_response])
+            } else if b > array.len() - 1 {
+                let resp = RedisResponse::List(
+                    array
+                        .range(a..)
+                        .map(|s| RedisResponse::Str(s.clone()))
+                        .collect(),
+                );
+                Ok(vec![resp.to_bytes()])
+            } else {
+                let resp = RedisResponse::List(
+                    array
+                        .range(a..=b)
+                        .map(|s| RedisResponse::Str(s.clone()))
+                        .collect(),
+                );
+                Ok(vec![resp.to_bytes()])
             }
         } else {
-            Ok(empty_array_response)
+            bail!("Failed to get array bounds");
         }
     } else {
-        bail!("Failed to get list key");
+        Ok(vec![empty_array_response])
     }
 }
 
 async fn handle_lpush(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     let (key, mut values) = {
         let mut drain = v.drain(*i + 1..);
         (drain.next(), drain.rev().collect::<VecDeque<_>>())
     };
 
-    if let Some(RedisValue::Primitive(key)) = key {
-        let mut db = db.lock().await;
+    if let Some(key) = key {
+        let mut db = server_state.db.lock().await;
 
-        if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
+        if let Some((DbValue::List(ref mut array), _)) = db.get_mut(&key) {
             values.append(array);
         }
         let size = values.len().to_isize().unwrap();
-        db.insert(key, (RedisValue::Arr(values), None));
+        db.insert(key, (DbValue::List(values), None));
 
-        let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
-        Ok(resp.to_bytes())
+        let resp = RedisResponse::Int(size);
+        Ok(vec![resp.to_bytes()])
     } else {
         bail!("Bad key: {key:?}");
     }
 }
 
 async fn handle_llen(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
 
-    if let RedisValue::Primitive(key) = &v[*i] {
-        let db = db.lock().await;
+    let key = &v[*i];
+    let db = server_state.db.lock().await;
 
-        if let Some((RedisValue::Arr(array), _)) = db.get(key) {
-            let size = array.len().to_isize().unwrap();
-            let resp = RedisValue::Primitive(PrimitiveRedisValue::Int(size));
+    if let Some((DbValue::List(array), _)) = db.get(key) {
+        let size = array.len().to_isize().unwrap();
+        let resp = RedisResponse::Int(size);
 
-            Ok(resp.to_bytes())
-        } else {
-            let zero_resp = RedisValue::Primitive(PrimitiveRedisValue::Int(0));
-
-            Ok(zero_resp.to_bytes())
-        }
+        Ok(vec![resp.to_bytes()])
     } else {
-        bail!("Bad key: {:?}", v[*i]);
+        let zero_resp = RedisResponse::Int(0);
+
+        Ok(vec![zero_resp.to_bytes()])
     }
 }
 
 async fn handle_lpop(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     let empty_response = "$-1\r\n";
     *i += 1;
 
-    if let RedisValue::Primitive(key) = &v[*i] {
-        let mut db = db.lock().await;
+    let key = &v[*i];
+    let mut db = server_state.db.lock().await;
 
-        if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(key) {
-            if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(n))) = v.get(*i + 1) {
-                *i += 1;
+    if let Some((DbValue::List(ref mut array), _)) = db.get_mut(key) {
+        if let Some(n) = v.get(*i + 1) {
+            *i += 1;
 
-                let n: usize = n.parse()?;
-                if n >= array.len() {
-                    let resp_vec: VecDeque<_> = array.drain(..).collect();
-
-                    Ok(RedisValue::Arr(resp_vec).to_bytes())
-                } else {
-                    let resp_vec: VecDeque<_> = array.drain(..n).collect();
-
-                    Ok(RedisValue::Arr(resp_vec).to_bytes())
-                }
+            let n: usize = n.parse()?;
+            if n >= array.len() {
+                let resp_vec: Vec<_> = array.drain(..).collect();
+                Ok(vec![RedisResponse::from_str_vec(&resp_vec).to_bytes()])
             } else {
-                let resp = array.pop_front();
-                if let Some(resp) = resp {
-                    Ok(resp.to_bytes())
-                } else {
-                    Ok(empty_response.into())
-                }
+                let resp_vec: Vec<_> = array.drain(..n).collect();
+
+                Ok(vec![RedisResponse::from_str_vec(&resp_vec).to_bytes()])
             }
         } else {
-            Ok(empty_response.into())
+            let resp = array.pop_front();
+            if let Some(resp) = resp {
+                Ok(vec![bulk_string(&resp)])
+            } else {
+                Ok(vec![empty_response.into()])
+            }
         }
     } else {
-        bail!("Bad key: {:?}", v[*i]);
+        Ok(vec![empty_response.into()])
     }
 }
 
 async fn handle_blpop(
-    db: &Db,
-    blocks: &Blocks,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     let mut interval = interval(Duration::from_millis(10));
     *i += 1;
 
-    if let RedisValue::Primitive(key) = &v[*i] {
-        {
-            let mut blocks = blocks.lock().await;
+    let key = &v[*i];
+    {
+        let mut blocks = server_state.blocks.lock().await;
 
-            if let Some(blocks_set) = blocks.get_mut(&key) {
-                blocks_set.insert((SystemTime::now(), task::id().to_string()));
-            } else {
-                let mut blocks_set: BTreeSet<(SystemTime, String)> = BTreeSet::new();
-                blocks_set.insert((SystemTime::now(), task::id().to_string()));
-                blocks.insert(key.clone(), blocks_set);
+        if let Some(blocks_set) = blocks.get_mut(key) {
+            blocks_set.insert((SystemTime::now(), task::id().to_string()));
+        } else {
+            let mut blocks_set: BTreeSet<(SystemTime, String)> = BTreeSet::new();
+            blocks_set.insert((SystemTime::now(), task::id().to_string()));
+            blocks.insert(key.clone(), blocks_set);
+        }
+    }
+
+    let expires = if let Some(t) = v.get(*i + 1) {
+        *i += 1;
+        if t == "0" {
+            None
+        } else {
+            let current_time = SystemTime::now();
+            current_time.checked_add(Duration::from_secs_f64(t.parse().unwrap()))
+        }
+    } else {
+        None
+    };
+
+    loop {
+        interval.tick().await;
+
+        if let Some(expires) = expires {
+            if expires < SystemTime::now() {
+                let mut blocks = server_state.blocks.lock().await;
+                let blocks_set = blocks.get_mut(key).expect("Blocks set should exist.");
+                blocks_set.retain(|(_, id)| *id != task::id().to_string());
+                if blocks_set.is_empty() {
+                    blocks.remove(key);
+                }
+                return Ok(vec!["$-1\r\n".into()]);
             }
         }
 
-        let expires =
-            if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(t))) = v.get(*i + 1) {
-                *i += 1;
-                if t == "0" {
-                    None
-                } else {
-                    let current_time = SystemTime::now();
-                    current_time.checked_add(Duration::from_secs_f64(t.parse().unwrap()))
-                }
-            } else {
-                None
-            };
+        let mut db = server_state.db.lock().await;
+        if let Some((DbValue::List(ref mut array), _)) = db.get_mut(key) {
+            if !array.is_empty() {
+                let mut blocks = server_state.blocks.lock().await;
+                if let Some(blocks_set) = blocks.get_mut(key) {
+                    if let Some((_, first_id)) = blocks_set.first() {
+                        if *first_id == task::id().to_string() {
+                            let value = array.pop_front().unwrap();
+                            blocks_set.pop_first();
 
-        loop {
-            interval.tick().await;
-
-            if let Some(expires) = expires {
-                if expires < SystemTime::now() {
-                    let mut blocks = blocks.lock().await;
-                    let blocks_set = blocks.get_mut(&key).expect("Blocks set should exist.");
-                    blocks_set.retain(|(_, id)| *id != task::id().to_string());
-                    if blocks_set.is_empty() {
-                        blocks.remove(&key);
-                    }
-                    return Ok("$-1\r\n".into());
-                }
-            }
-
-            let mut db = db.lock().await;
-            if let Some((RedisValue::Arr(ref mut array), _)) = db.get_mut(&key) {
-                if !array.is_empty() {
-                    let mut blocks = blocks.lock().await;
-                    if let Some(blocks_set) = blocks.get_mut(&key) {
-                        if let Some((_, first_id)) = blocks_set.first() {
-                            if *first_id == task::id().to_string() {
-                                let value = array.pop_front().unwrap();
-                                blocks_set.pop_first();
-
-                                if blocks_set.is_empty() {
-                                    blocks.remove(&key);
-                                }
-
-                                let resp_vec: VecDeque<_> =
-                                    vec![RedisValue::Primitive(key.clone()), value].into();
-
-                                let resp = RedisValue::Arr(resp_vec).to_bytes();
-
-                                return Ok(resp);
+                            if blocks_set.is_empty() {
+                                blocks.remove(key);
                             }
+
+                            let resp_vec =
+                                vec![RedisResponse::Str(key.clone()), RedisResponse::Str(value)];
+
+                            let resp = RedisResponse::List(resp_vec).to_bytes();
+
+                            return Ok(vec![resp]);
                         }
                     }
                 }
             }
         }
-    } else {
-        bail!("BLPOP: Invalid key")
     }
 }
 
 async fn handle_type(
-    db: &Db,
-    streams: &Streams,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
 
-    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
-        let db = db.lock().await;
+    if let Some(key) = v.get(*i) {
+        let db = server_state.db.lock().await;
 
-        if db.get(key).is_some() {
-            return Ok("+string\r\n".into());
-        } else {
-            let streams = streams.lock().await;
-            if streams.get(key).is_some() {
-                return Ok("+stream\r\n".into());
+        match db.get(key) {
+            Some((DbValue::String(_), _)) | Some((DbValue::List(_), _)) => {
+                Ok(vec!["+string\r\n".into()])
             }
+            Some((DbValue::Stream(_), _)) => Ok(vec!["+stream\r\n".into()]),
+            None => Ok(vec!["+none\r\n".into()]),
         }
-        Ok("+none\r\n".into())
     } else {
-        bail!("Bad key");
+        bail!("TYPE: No key");
     }
 }
 
 async fn handle_xadd(
-    streams: &Streams,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
 
-    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
-        let mut streams = streams.lock().await;
+    if let Some(key) = v.get(*i) {
+        let mut db = server_state.db.lock().await;
 
-        let stream_vec = if let Some(stream_vec) = streams.get_mut(key) {
+        let stream_vec = if let Some((DbValue::Stream(stream_vec), _)) = db.get_mut(key) {
             stream_vec
         } else {
-            streams.insert(key.clone(), Vec::new());
-            streams.get_mut(key).unwrap()
+            db.insert(key.clone(), (DbValue::Stream(Vec::new()), None));
+            db.get_mut(key).unwrap().0.to_stream_vec_mut().unwrap()
         };
 
-        if let Some(RedisValue::Primitive(PrimitiveRedisValue::Str(id))) = v.get(*i + 1) {
+        if let Some(id) = v.get(*i + 1) {
             *i += 1;
 
-            let id = match generate_and_validate_stream_id(stream_vec, id) {
+            let id = match generate_and_validate_stream_id(&stream_vec[..], id) {
                 Ok(id) => id,
                 Err(StreamIdValidationError::Zero) => {
-                    return Ok("-ERR The ID specified in XADD must be greater than 0-0\r\n".into())
+                    return Ok(vec![
+                        "-ERR The ID specified in XADD must be greater than 0-0\r\n".into(),
+                    ])
                 }
                 Err(StreamIdValidationError::DecreasingTimestamp)
                 | Err(StreamIdValidationError::NonincreasingSequence) => {
-                    return Ok("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".into());
+                    return Ok(vec!["-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".into()]);
                 }
                 Err(e) => bail!(e),
             };
 
             let mut args: Vec<_> = v.drain(*i + 1..).collect();
 
-            let mut map = HashMap::new();
+            let mut map = IndexMap::new();
 
             for (stream_key, value) in args.drain(..).tuples() {
-                if let RedisValue::Primitive(stream_key) = stream_key {
-                    map.insert(stream_key, value);
-                }
+                map.insert(stream_key, value);
             }
 
             let result = StreamElement::new(id.clone(), map);
             stream_vec.push(result);
 
-            Ok(RedisValue::Primitive(PrimitiveRedisValue::Str(id)).to_bytes())
+            Ok(vec![
+                RedisValue::Primitive(PrimitiveRedisValue::Str(id)).to_bytes()
+            ])
         } else {
             bail!("Could not get id");
         }
@@ -889,29 +789,28 @@ async fn handle_xadd(
 }
 
 async fn handle_xrange(
-    streams: &Streams,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
 
-    if let Some(RedisValue::Primitive(key)) = v.get(*i) {
-        let streams = streams.lock().await;
+    if let Some(key) = v.get(*i) {
+        let db = server_state.db.lock().await;
 
-        if let Some(stream_vec) = streams.get(key) {
+        if let Some((DbValue::Stream(stream_vec), _)) = db.get(key) {
             let mut drain = v.drain(*i + 1..*i + 3);
             let start = drain.next().unwrap();
             let end = drain.next().unwrap();
 
             let (start_timestamp, start_sequence): (u128, usize) = {
-                let start = start.to_str().unwrap();
                 if start == "-" {
                     (0, 0)
                 } else {
                     let (start_timestamp, start_sequence) = if start.contains("-") {
                         start.split_once("-").unwrap()
                     } else {
-                        (start, "0")
+                        (start.as_str(), "0")
                     };
                     (
                         start_timestamp.parse().unwrap(),
@@ -920,14 +819,13 @@ async fn handle_xrange(
                 }
             };
             let (end_timestamp, end_sequence): (u128, usize) = {
-                let end = end.to_str().unwrap();
                 if end == "+" {
                     (u128::MAX, usize::MAX)
                 } else {
                     let (end_timestamp, end_sequence) = if end.contains("-") {
                         end.split_once("-").unwrap()
                     } else {
-                        (end, "inf")
+                        (end.as_str(), "inf")
                     };
                     (
                         end_timestamp.parse().unwrap(),
@@ -940,7 +838,7 @@ async fn handle_xrange(
                 }
             };
 
-            let mut result_vec: Vec<&StreamElement> = Vec::new();
+            let mut result_vec = Vec::new();
 
             for value in stream_vec {
                 let (timestamp, sequence) = value.id.split_once("-").unwrap();
@@ -958,55 +856,28 @@ async fn handle_xrange(
                     result_vec.push(value);
                 }
             }
-
-            let result_vec: VecDeque<_> = result_vec
-                .into_iter()
-                .map(|element| {
-                    RedisValue::Arr(
-                        vec![
-                            RedisValue::Primitive(PrimitiveRedisValue::Str(element.id.clone())),
-                            RedisValue::Arr(
-                                element
-                                    .value
-                                    .iter()
-                                    .flat_map(|(k, v)| {
-                                        [RedisValue::Primitive(k.clone()), v.clone()]
-                                    })
-                                    .collect(),
-                            ),
-                        ]
-                        .into(),
-                    )
-                })
-                .collect();
-
-            Ok(RedisValue::Arr(result_vec).to_bytes())
+            Ok(vec![RedisResponse::from(result_vec).to_bytes()])
         } else {
-            Ok(RedisValue::Arr(VecDeque::new()).to_bytes())
+            Ok(vec![RedisResponse::List(vec![]).to_bytes()])
         }
     } else {
-        bail!("Bad key");
+        bail!("XADD: No key argument")
     }
 }
 
 async fn handle_xread(
-    streams: &Streams,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
 
     if let Some(arg) = v.get(*i) {
-        if arg
-            .to_str()
-            .is_some_and(|s| s.to_ascii_lowercase() == "block")
-        {
+        if arg.to_ascii_lowercase() == "block" {
             *i += 1;
             let mut interval = interval(Duration::from_millis(10));
 
             let timeout: u64 = v[*i]
-                .to_str()
-                .expect("Timeout arg should be a string")
                 .parse()
                 .expect("Timeout arg should be an unsigned int");
 
@@ -1022,26 +893,26 @@ async fn handle_xread(
                 None
             };
 
-            let key = v[*i + 1]
-                .to_primitive()
-                .expect("Key should be a primitive redis value");
-
-            let start = v[*i + 2].to_str().expect("Start id should be a string");
+            let key = &v[*i + 1];
+            let start = &v[*i + 2];
 
             let (start_timestamp, start_sequence) = {
-                let streams = streams.lock().await;
-                parse_id_with_dollar_sign(start, streams.get(key).unwrap_or(&vec![]))
+                let db = server_state.db.lock().await;
+                parse_id_with_dollar_sign(
+                    &start,
+                    db.get(key).and_then(|(val, _)| val.to_stream_vec()),
+                )
             };
 
             loop {
                 interval.tick().await;
 
                 if expires.is_some_and(|exp| exp < SystemTime::now()) {
-                    return Ok("$-1\r\n".into());
+                    return Ok(vec!["$-1\r\n".into()]);
                 }
 
-                if let Ok(streams) = streams.try_lock() {
-                    if let Some(stream_vec) = streams.get(key) {
+                if let Ok(db) = server_state.db.try_lock() {
+                    if let Some((DbValue::Stream(stream_vec), _)) = db.get(key) {
                         if let Some(last) = stream_vec.last() {
                             let (timestamp, sequence) = parse_id(&last.id);
                             if timestamp > start_timestamp
@@ -1065,10 +936,9 @@ async fn handle_xread(
                                     key.clone(),
                                 );
 
-                                let resp_value =
-                                    RedisValue::Arr(vec![RedisValue::Arr(result_vec)].into());
+                                let resp_value = RedisResponse::List(vec![result_vec].into());
 
-                                return Ok(resp_value.to_bytes());
+                                return Ok(vec![resp_value.to_bytes()]);
                             }
                         }
                     }
@@ -1079,19 +949,16 @@ async fn handle_xread(
 
     *i += 1;
 
-    let streams = streams.lock().await;
+    let db = server_state.db.lock().await;
 
     let mut keys = Vec::new();
 
-    while v[*i]
-        .to_primitive()
-        .is_some_and(|key| streams.contains_key(key))
-    {
-        keys.push(v[*i].to_primitive().unwrap());
+    while db.contains_key(&v[*i]) {
+        keys.push(&v[*i]);
         *i += 1;
     }
 
-    let starts: Vec<_> = v.range(*i..).map(|value| value.to_str().unwrap()).collect();
+    let starts = &v[*i..];
 
     if keys.len() != starts.len() {
         bail!(
@@ -1101,40 +968,45 @@ async fn handle_xread(
         );
     }
 
-    let result_vec: VecDeque<_> = keys
+    let result_vec: Vec<_> = keys
         .into_iter()
         .zip(starts)
         .map(|(k, start)| {
             let (start_timestamp, start_sequence) = parse_id(start);
-            RedisValue::Arr(gather_stream_read_results(
-                streams.get(k).unwrap().iter().collect(),
+            gather_stream_read_results(
+                db.get(k)
+                    .unwrap()
+                    .0
+                    .to_stream_vec()
+                    .expect("XREAD: a given key was not to a stream")
+                    .iter()
+                    .collect(),
                 start_timestamp,
                 start_sequence,
                 k.clone(),
-            ))
+            )
         })
         .collect();
 
-    Ok(RedisValue::Arr(result_vec).to_bytes())
+    Ok(vec![RedisResponse::List(result_vec).to_bytes()])
 }
 
 async fn handle_incr(
-    db: &Db,
-    v: &mut VecDeque<RedisValue>,
+    server_state: ServerState,
+    v: &mut Vec<String>,
     i: &mut usize,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<Vec<Bytes>> {
     *i += 1;
 
-    let key = v[*i].to_primitive().unwrap();
+    let key = &v[*i];
 
-    let mut db = db.lock().await;
+    let mut db = server_state.db.lock().await;
 
     let updated_int = match db.entry(key.clone()) {
         Entry::Occupied(mut occ) => {
-            let (old_val, expired) = occ.get();
-            if let Some(s) = old_val.to_str() {
-                if let Ok(n) = s.parse::<isize>() {
-                    occ.insert(((n + 1).to_string().into(), *expired));
+            if let (DbValue::String(old_val), expired) = occ.get() {
+                if let Ok(n) = old_val.parse::<isize>() {
+                    occ.insert((DbValue::String((n + 1).to_string()), *expired));
                     Some(n + 1)
                 } else {
                     None
@@ -1144,78 +1016,72 @@ async fn handle_incr(
             }
         }
         Entry::Vacant(vac) => {
-            vac.insert(("1".to_string().into(), None));
+            vac.insert((DbValue::String("1".to_string()), None));
             Some(1isize)
         }
     };
 
     if let Some(n) = updated_int {
         let resp_val: RedisValue = n.into();
-        Ok(resp_val.to_bytes())
+        Ok(vec![resp_val.to_bytes()])
     } else {
-        Ok("-ERR value is not an integer or out of range\r\n".into())
+        Ok(vec![
+            "-ERR value is not an integer or out of range\r\n".into()
+        ])
     }
 }
 
-async fn handle_multi(transaction_active: &mut bool) -> anyhow::Result<Bytes> {
-    *transaction_active = true;
-    Ok("+OK\r\n".into())
+async fn handle_multi(mut connection_state: ConnectionState) -> anyhow::Result<Vec<Bytes>> {
+    connection_state.set_transaction_active(true);
+    Ok(vec!["+OK\r\n".into()])
 }
 
 async fn handle_exec(
-    transaction_queue: &mut VecDeque<(VecDeque<RedisValue>, usize)>,
-    db: &Db,
-    blocks: &Blocks,
-    streams: &Streams,
-    transaction_active: &mut bool,
-    replica_offset: Arc<AtomicUsize>,
-    replica_count: Option<Arc<AtomicUsize>>,
-) -> anyhow::Result<Bytes> {
+    server_state: ServerState,
+    mut connection_state: ConnectionState,
+) -> anyhow::Result<Vec<Bytes>> {
     let mut buf = BytesMut::new();
+    let cs = connection_state.clone();
+    let mut transaction_queue = cs.transaction_queue.lock().await;
 
     buf.put_slice(format!("*{}\r\n", transaction_queue.len()).as_bytes());
 
-    for (args, message_len) in transaction_queue {
-        let resp = execute_command(
+    for (args, message_len) in transaction_queue.iter_mut() {
+        let responses = execute_command(
             args,
-            db,
-            blocks,
-            streams,
-            transaction_active,
-            Arc::clone(&replica_offset),
             *message_len,
-            replica_count.clone(),
+            server_state.clone(),
+            connection_state.clone(),
         )
         .await?;
-        buf.put_slice(&resp);
+        for resp in responses {
+            buf.put_slice(&resp);
+        }
     }
 
-    *transaction_active = false;
+    connection_state.set_transaction_active(false);
 
-    Ok(buf.freeze())
+    Ok(vec![buf.freeze()])
 }
 
-fn queue_command(
-    transaction_queue: &mut VecDeque<(VecDeque<RedisValue>, usize)>,
+async fn queue_command(
+    mut connection_state: ConnectionState,
     message_len: usize,
-    args: VecDeque<RedisValue>,
-) -> Bytes {
-    transaction_queue.push_back((args, message_len));
-    "+QUEUED\r\n".into()
+    args: Vec<String>,
+) -> Vec<Bytes> {
+    connection_state.queue_command(message_len, args).await;
+    vec!["+QUEUED\r\n".into()]
 }
 
-fn handle_discard(
-    transaction_queue: &mut VecDeque<(VecDeque<RedisValue>, usize)>,
-    transaction_active: &mut bool,
-) -> Bytes {
-    transaction_queue.clear();
-    *transaction_active = false;
-    "+OK\r\n".into()
+async fn handle_discard(mut connection_state: ConnectionState) -> Vec<Bytes> {
+    connection_state.clear_transactions().await;
+    connection_state.set_transaction_active(false);
+    vec!["+OK\r\n".into()]
 }
 
-fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
-    match v[1].to_str().map(|s| s.to_ascii_lowercase()) {
-        Some(s) if s == "replication" => {
+fn handle_info(v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+    match v[1].to_ascii_lowercase().as_str() {
+        "replication" => {
             let global_config = GLOBAL_CONFIG.get().unwrap();
             let mut lines = vec![format!("role:{}", global_config.instance_type)];
             if global_config.instance_type == InstanceType::Master {
@@ -1224,57 +1090,82 @@ fn handle_info(v: &mut VecDeque<RedisValue>) -> anyhow::Result<Bytes> {
                 ));
                 lines.push(format!("master_repl_offset:0"));
             }
-            Ok(bulk_string(lines.join("\r\n").as_str()))
+            Ok(vec![bulk_string(lines.join("\r\n").as_str())])
         }
         _ => bail!(format!("INFO: Invalid argument {:?}", v[1])),
     }
 }
 
-fn handle_psync() -> anyhow::Result<Bytes> {
-    let global_config = GLOBAL_CONFIG.get().unwrap();
-    let master_config = global_config
-        .master_config
-        .clone()
-        .ok_or(anyhow!("Called PSYNC on a replica"))?;
+async fn handle_psync(
+    server_state: ServerState,
+    mut connection_state: ConnectionState,
+) -> anyhow::Result<Vec<Bytes>> {
+    if let Some(master_state) = server_state.clone().master_state() {
+        let global_config = GLOBAL_CONFIG.get().unwrap();
+        let master_config = global_config.master_config.as_ref().unwrap();
 
-    Ok(format!("+FULLRESYNC {} 0\r\n", master_config.replication_id).into())
-}
-
-fn handle_replconf(
-    v: &mut VecDeque<RedisValue>,
-    replica_offset: Arc<AtomicUsize>,
-    message_len: usize,
-) -> anyhow::Result<Bytes> {
-    if let Some(s) = v.get(1).and_then(|val| val.to_str()) {
-        if s.to_ascii_uppercase() == "GETACK" {
-            let offset = replica_offset.load(Ordering::SeqCst) - message_len;
-            let resp_vec = vec![
-                RedisValue::Primitive(PrimitiveRedisValue::Str("REPLCONF".to_string())),
-                RedisValue::Primitive(PrimitiveRedisValue::Str("ACK".to_string())),
-                RedisValue::Primitive(PrimitiveRedisValue::Str(offset.to_string())),
-            ];
-            Ok(vec_of_values_to_resp(&resp_vec.into()))
-        } else {
-            Ok("+OK\r\n".into())
-        }
+        let new_replica_id = master_state.create_replica().await;
+        connection_state.set_replica_id(new_replica_id)?;
+        connection_state.set_connection_type(ConnectionType::MasterToReplica);
+        Ok(vec![
+            format!("+FULLRESYNC {} 0\r\n", master_config.replication_id).into(),
+            EMPTY_RDB_BYTES.clone(),
+        ])
     } else {
-        Ok("+OK\r\n".into())
+        bail!("Tried to call PSYNC on a replica")
     }
 }
 
-async fn handle_wait(
-    v: &mut VecDeque<RedisValue>,
-    replica_count: Option<Arc<AtomicUsize>>,
-) -> anyhow::Result<Bytes> {
-    if let Some(replica_count) = replica_count {
+async fn handle_replconf(
+    v: &mut Vec<String>,
+    message_len: usize,
+    mut server_state: ServerState,
+    connection_state: ConnectionState,
+) -> anyhow::Result<Vec<Bytes>> {
+    if let Some(s) = v.get(1) {
+        match s.to_ascii_uppercase().as_str() {
+            "GETACK" => {
+                let offset = server_state.load_offset() - message_len;
+                let resp = RedisResponse::List(vec![
+                    RedisResponse::Str("REPLCONF".to_string()),
+                    RedisResponse::Str("ACK".to_string()),
+                    RedisResponse::Str(offset.to_string()),
+                ]);
+                Ok(vec![resp.to_bytes()])
+            }
+            "ACK" => {
+                let offset: usize = v
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .expect("ACK: Invalid offset");
+
+                if let Some(master_state) = server_state.master_state() {
+                    if let Some(replica_id) = connection_state.get_replica_id() {
+                        master_state.update_offset_tracker(replica_id, offset).await;
+                        Ok(vec![])
+                    } else {
+                        bail!("ACK: ack was sent, but not from a replica")
+                    }
+                } else {
+                    bail!("ACK: ack was sent, but not to a master")
+                }
+            }
+            _ => Ok(vec!["+OK\r\n".into()]),
+        }
+    } else {
+        Ok(vec!["+OK\r\n".into()])
+    }
+}
+
+async fn handle_wait(v: &mut Vec<String>, server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
+    if let Some(master_state) = server_state.clone().master_state() {
+        let GETACK_MSG_LEN = 37;
         let n = v
             .get(1)
-            .and_then(|val| val.to_str())
             .and_then(|s| s.parse::<usize>().ok())
             .expect("WAIT: Invalid replica count");
         let timeout = v
             .get(2)
-            .and_then(|val| val.to_str())
             .and_then(|s| s.parse::<u64>().ok())
             .expect("WAIT: Invalid timeout");
 
@@ -1284,24 +1175,39 @@ async fn handle_wait(
 
         let mut interval = interval(Duration::from_millis(10));
 
+        master_state
+            .broadcast_to_replicas("*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n".into())?;
+
+        // The master offset is not updated while WAIT blocks
+        let master_offset = server_state.load_offset();
+
         loop {
             interval.tick().await;
-            let rc = replica_count.load(Ordering::Relaxed);
 
-            if expires < SystemTime::now() || n <= rc {
-                return Ok(format!(":{}\r\n", rc).into());
+            let offsets = &master_state.get_replica_tracker().await.offsets;
+
+            let caught_up_replicas = offsets.iter().fold(0usize, |acc, (_, offset)| {
+                if *offset == master_offset - GETACK_MSG_LEN || *offset == master_offset {
+                    acc + 1
+                } else {
+                    acc
+                }
+            });
+
+            if expires < SystemTime::now() || n <= caught_up_replicas {
+                return Ok(vec![format!(":{caught_up_replicas}\r\n").into()]);
             }
         }
     }
     bail!("Called WAIT on a replica");
 }
 
-fn gather_stream_read_results(
-    stream_vec: Vec<&StreamElement>,
+fn gather_stream_read_results<'a>(
+    stream_vec: Vec<&'a StreamElement>,
     start_timestamp: u128,
     start_sequence: usize,
-    key: PrimitiveRedisValue,
-) -> VecDeque<RedisValue> {
+    key: String,
+) -> RedisResponse {
     let mut results_vec = Vec::new();
 
     for element in stream_vec {
@@ -1317,32 +1223,7 @@ fn gather_stream_read_results(
         }
     }
 
-    vec![
-        RedisValue::Primitive(key.clone()),
-        RedisValue::Arr(
-            results_vec
-                .into_iter()
-                .map(|element| {
-                    RedisValue::Arr(
-                        vec![
-                            element.id.clone().into(),
-                            RedisValue::Arr(
-                                element
-                                    .value
-                                    .iter()
-                                    .flat_map(|(k, v)| {
-                                        [RedisValue::Primitive(k.clone()), v.clone()]
-                                    })
-                                    .collect(),
-                            ),
-                        ]
-                        .into(),
-                    )
-                })
-                .collect(),
-        ),
-    ]
-    .into()
+    RedisResponse::from_stream(key, results_vec)
 }
 
 fn generate_and_validate_stream_id(
@@ -1433,6 +1314,32 @@ fn generate_and_validate_stream_id(
     }
 }
 
+fn send_getack(mut server_state: ServerState) -> anyhow::Result<()> {
+    let resp: Bytes = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n".into();
+    server_state.add_to_master_offset(resp.len())?;
+    server_state
+        .master_state()
+        .unwrap()
+        .broadcast_to_replicas(resp)
+}
+
+async fn send_ack(
+    server_state: ServerState,
+    connection_state: ConnectionState,
+) -> anyhow::Result<()> {
+    let offset = server_state.load_offset();
+    let resp_vec = vec![
+        RedisValue::Primitive(PrimitiveRedisValue::Str("REPLCONF".to_string())),
+        RedisValue::Primitive(PrimitiveRedisValue::Str("ACK".to_string())),
+        RedisValue::Primitive(PrimitiveRedisValue::Str(offset.to_string())),
+    ];
+    connection_state
+        .stream_tx
+        .send(vec_of_values_to_resp(&resp_vec.into()))
+        .await
+        .map_err(|_| anyhow!("Failed to send ack"))
+}
+
 fn bulk_string(s: &str) -> Bytes {
     format!("${}\r\n{s}\r\n", s.len()).into()
 }
@@ -1447,10 +1354,13 @@ fn parse_id(input: &str) -> (u128, usize) {
     )
 }
 
-fn parse_id_with_dollar_sign(input: &str, stream_vec: &Vec<StreamElement>) -> (u128, usize) {
+fn parse_id_with_dollar_sign(
+    input: &str,
+    stream_vec: Option<&Vec<StreamElement>>,
+) -> (u128, usize) {
     let (start_timestamp, start_sequence) = if input == "$" {
         stream_vec
-            .last()
+            .and_then(|stream_vec| stream_vec.last())
             .map(|entry| entry.id.split_once("-").unwrap())
             .unwrap_or(("0", "0"))
     } else {
@@ -1473,6 +1383,17 @@ fn vec_of_values_to_resp(v: &VecDeque<RedisValue>) -> Bytes {
     }
 
     buf.freeze()
+}
+
+async fn receive_if<T>(receiver: &mut Option<broadcast::Receiver<T>>) -> Result<T, RecvError>
+where
+    T: Clone,
+{
+    if let Some(receiver) = receiver {
+        receiver.recv().await
+    } else {
+        future::pending::<Result<T, RecvError>>().await
+    }
 }
 
 #[derive(Error, Debug)]
