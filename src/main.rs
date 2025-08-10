@@ -1,5 +1,6 @@
 mod args;
 mod db_value;
+mod global_config;
 mod hex;
 mod parser;
 mod redis_value;
@@ -9,7 +10,6 @@ mod state;
 
 use std::{
     collections::{hash_map::Entry, BTreeSet, VecDeque},
-    fmt::{self, Display, Formatter},
     future,
     sync::{LazyLock, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -22,6 +22,7 @@ use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use db_value::{DbValue, StreamElement};
+use global_config::{GlobalConfig, MasterConfig, SlaveConfig};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use num::ToPrimitive;
@@ -47,40 +48,6 @@ const EMPTY_RDB_BYTES: LazyLock<Bytes> = LazyLock::new(|| {
 });
 const WRITE_COMMANDS: [&str; 7] = ["SET", "DEL", "RPUSH", "LPOP", "BLPOP", "XADD", "INCR"];
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum InstanceType {
-    Master,
-    Slave,
-}
-
-impl Display for InstanceType {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let s = match self {
-            InstanceType::Master => "master",
-            InstanceType::Slave => "slave",
-        };
-        write!(f, "{s}")
-    }
-}
-
-#[derive(Debug)]
-struct GlobalConfig {
-    instance_type: InstanceType,
-    master_config: Option<MasterConfig>,
-    slave_config: Option<SlaveConfig>,
-}
-
-#[derive(Debug)]
-struct SlaveConfig {
-    master_address: String,
-    master_port: usize,
-}
-
-#[derive(PartialEq, Eq, Clone, Debug)]
-struct MasterConfig {
-    replication_id: String,
-}
-
 static GLOBAL_CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
 
 #[tokio::main]
@@ -93,29 +60,17 @@ async fn main() -> anyhow::Result<()> {
     let is_master = args.replicaof.is_none();
 
     GLOBAL_CONFIG
-        .set(if args.replicaof.is_some() {
+        .set(if is_master {
+            let master_config = MasterConfig::new();
+            GlobalConfig::new_from_master_config(master_config, args.dir, args.dbfilename)
+        } else {
             let replicaof = args.replicaof.unwrap();
             let (addr, port) = replicaof.split_once(" ").expect("Invalid replicaof");
-            let slave_config = Some(SlaveConfig {
-                master_address: addr.to_string(),
-                master_port: port.parse().expect("Invalid master port"),
-            });
-            GlobalConfig {
-                instance_type: InstanceType::Slave,
-                slave_config,
-                master_config: None,
-            }
-        } else {
-            let master_config = Some(MasterConfig {
-                replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
-            });
-            GlobalConfig {
-                instance_type: InstanceType::Master,
-                slave_config: None,
-                master_config,
-            }
+            let slave_config =
+                SlaveConfig::new(addr.to_string(), port.parse().expect("Invalid master port"));
+            GlobalConfig::new_from_slave_config(slave_config, args.dir, args.dbfilename)
         })
-        .map_err(|_| anyhow!("Failed to set instance type"))?;
+        .map_err(|_| anyhow!("Tried to set global config, but it was already set"))?;
 
     let (replica_tx, _) = broadcast::channel::<Bytes>(32);
 
@@ -159,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         });
     } else {
         let global_config = GLOBAL_CONFIG.get().unwrap();
-        let slave_config = global_config.slave_config.as_ref().unwrap();
+        let slave_config = global_config.get_slave_config().unwrap();
 
         let mut master_stream = TcpStream::connect(format!(
             "{}:{}",
@@ -202,7 +157,6 @@ async fn process(
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = stream_rx.recv().await {
-            println!("Sending msg: {}", String::from_utf8_lossy(&msg));
             if let Err(e) = stream_writer.write_all(&msg).await {
                 println!("Stream write error: {e}");
                 break;
@@ -269,7 +223,7 @@ async fn process_input(
     mut server_state: ServerState,
     connection_state: ConnectionState,
 ) -> anyhow::Result<()> {
-    let commands_nonempty = !results.is_empty();
+    // let commands_nonempty = !results.is_empty();
     for (mut v, message_len) in results {
         if connection_state.get_transaction_active() {
             match v[0].to_ascii_uppercase().as_str() {
@@ -373,6 +327,7 @@ async fn execute_command(
         "REPLCONF" => handle_replconf(v, message_len, server_state, connection_state).await,
         "WAIT" => handle_wait(v, server_state).await,
         "PSYNC" => handle_psync(server_state, connection_state).await,
+        "CONFIG" => handle_config(v),
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -1083,11 +1038,9 @@ fn handle_info(v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
     match v[1].to_ascii_lowercase().as_str() {
         "replication" => {
             let global_config = GLOBAL_CONFIG.get().unwrap();
-            let mut lines = vec![format!("role:{}", global_config.instance_type)];
-            if global_config.instance_type == InstanceType::Master {
-                lines.push(format!(
-                    "master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
-                ));
+            let mut lines = vec![format!("role:{}", global_config.role())];
+            if let Some(master_config) = global_config.get_master_config() {
+                lines.push(format!("master_replid:{}", master_config.replication_id));
                 lines.push(format!("master_repl_offset:0"));
             }
             Ok(vec![bulk_string(lines.join("\r\n").as_str())])
@@ -1102,7 +1055,7 @@ async fn handle_psync(
 ) -> anyhow::Result<Vec<Bytes>> {
     if let Some(master_state) = server_state.clone().master_state() {
         let global_config = GLOBAL_CONFIG.get().unwrap();
-        let master_config = global_config.master_config.as_ref().unwrap();
+        let master_config = global_config.get_master_config().unwrap();
 
         let new_replica_id = master_state.create_replica().await;
         connection_state.set_replica_id(new_replica_id)?;
@@ -1200,6 +1153,30 @@ async fn handle_wait(v: &mut Vec<String>, server_state: ServerState) -> anyhow::
         }
     }
     bail!("Called WAIT on a replica");
+}
+
+fn handle_config(v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+    if v.len() <= 1 {
+        bail!("CONFIG: No command given");
+    }
+    match v[1].to_ascii_uppercase().as_str() {
+        "GET" => {
+            let global_config = GLOBAL_CONFIG.get().unwrap();
+            let key = v
+                .get(2)
+                .map(|s| s.to_ascii_lowercase())
+                .ok_or(anyhow!("CONFIG: No key provided"))?;
+            let value = match key.as_str() {
+                "dir" => global_config.dir.clone(),
+                "dbfilename" => global_config.dbfilename.clone(),
+                _ => bail!("CONFIG GET: Invalid config key"),
+            }
+            .unwrap_or("".to_string());
+            let resp = RedisResponse::from_str_vec(&vec![key, value]);
+            Ok(vec![resp.to_bytes()])
+        }
+        cmd => bail!("CONFIG: invalid command: {cmd}"),
+    }
 }
 
 fn gather_stream_read_results<'a>(
