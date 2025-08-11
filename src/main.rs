@@ -1277,7 +1277,7 @@ async fn handle_subscribe(
 ) -> anyhow::Result<Vec<Bytes>> {
     if let Some(key) = v.get(1) {
         if connection_state.subscribe(key).await {
-            server_state.add_subscription(key.to_string());
+            server_state.add_subscription(key.to_string()).await;
         }
         let sub_count: isize = connection_state
             .subscription_count()
