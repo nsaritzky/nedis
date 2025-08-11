@@ -431,7 +431,7 @@ async fn expect_response(stream: &mut TcpStream, expected_response: &[u8]) -> an
 
 fn handle_ping(connection_state: ConnectionState) -> anyhow::Result<Vec<Bytes>> {
     if connection_state.get_subscribe_mode() {
-        Ok(vec![RedisResponse::List(vec!["PONG".into(), "".into()]).to_bytes()])
+        Ok(vec![RedisResponse::List(vec!["pong".into(), "".into()]).to_bytes()])
     } else {
         Ok(vec!["+PONG\r\n".into()])
     }
