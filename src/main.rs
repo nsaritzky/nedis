@@ -49,6 +49,14 @@ const EMPTY_RDB_BYTES: LazyLock<Bytes> = LazyLock::new(|| {
     res.freeze()
 });
 const WRITE_COMMANDS: [&str; 7] = ["SET", "DEL", "RPUSH", "LPOP", "BLPOP", "XADD", "INCR"];
+const SUBSCRIBED_ALLOWED_COMMANDS: [&str; 6] = [
+    "SUBSCRIBE",
+    "UNSUBSCRIBE",
+    "PSUBSCRIBE",
+    "PUNSUBSCRIBE",
+    "PING",
+    "QUIT",
+];
 
 static GLOBAL_CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
 
@@ -293,13 +301,19 @@ async fn process_input(
                 server_state.add_to_replica_offset(message_len)?;
             }
 
-            let responses = execute_command(
-                &mut v,
-                message_len,
-                server_state.clone(),
-                connection_state.clone(),
-            )
-            .await?;
+            let responses = if connection_state.get_subscribe_mode()
+                && !SUBSCRIBED_ALLOWED_COMMANDS.contains(&v[0].as_str())
+            {
+                vec![format!("-ERR Can't execute '{}'\r\n", v[0]).into()]
+            } else {
+                execute_command(
+                    &mut v,
+                    message_len,
+                    server_state.clone(),
+                    connection_state.clone(),
+                )
+                .await?
+            };
 
             println!(
                 "Processing command: {v:?}, Connection type: {:?}",
@@ -1249,14 +1263,15 @@ async fn handle_subscribe(
 ) -> anyhow::Result<Vec<Bytes>> {
     if let Some(key) = v.get(1) {
         connection_state.subscribe(key).await;
-        let sub_count: isize = connection_state.subscription_count().await.try_into().unwrap();
-        let resp: RedisResponse = vec![
-            "subscribe".into(),
-            key.to_string().into(),
-            sub_count.into()
-        ]
-        .into_iter()
-        .collect();
+        let sub_count: isize = connection_state
+            .subscription_count()
+            .await
+            .try_into()
+            .unwrap();
+        let resp: RedisResponse =
+            vec!["subscribe".into(), key.to_string().into(), sub_count.into()]
+                .into_iter()
+                .collect();
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("SUBSCRIBE: No key provided");

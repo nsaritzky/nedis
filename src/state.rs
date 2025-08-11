@@ -167,6 +167,7 @@ pub struct ConnectionState {
     replica_id: Arc<AtomicUsize>,
     pub stream_tx: mpsc::Sender<Bytes>,
     subscriptions: Arc<RwLock<HashSet<String>>>,
+    subscribed_mode: Arc<AtomicBool>
 }
 
 impl ConnectionState {
@@ -178,7 +179,8 @@ impl ConnectionState {
             transaction_queue: Arc::new(Mutex::new(Vec::new())),
             replica_id: Arc::new(AtomicUsize::new(UNSET)),
             stream_tx,
-            subscriptions: Arc::new(RwLock::new(HashSet::new()))
+            subscriptions: Arc::new(RwLock::new(HashSet::new())),
+            subscribed_mode: Arc::new(AtomicBool::new(false))
         }
     }
 
@@ -228,11 +230,16 @@ impl ConnectionState {
 
     pub async fn subscribe(&mut self, key: &str) {
         let mut subs = self.subscriptions.write().await;
+        self.subscribed_mode.store(true, Ordering::Relaxed);
         subs.insert(key.to_string());
     }
 
     pub async fn subscription_count(&self) -> usize {
         let subs = self.subscriptions.read().await;
         subs.len()
+    }
+
+    pub fn get_subscribe_mode(&self) -> bool {
+        self.subscribed_mode.load(Ordering::Relaxed)
     }
 }
