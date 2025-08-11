@@ -18,12 +18,14 @@ use crate::{db_value::DbValue, replica_tracker::ReplicaTracker};
 type Db = Arc<RwLock<HashMap<String, (DbValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
 type TransactionQueue = Arc<Mutex<Vec<(Vec<String>, usize)>>>;
+type Subscriptions = Arc<RwLock<HashMap<String, usize>>>;
 
 #[derive(Debug, Clone)]
 pub struct ServerState {
     pub state: Either<MasterState, ReplicaState>,
     pub db: Db,
     pub blocks: Blocks,
+    subscriptions: Subscriptions,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,7 @@ impl ServerState {
             },
             db: Arc::new(RwLock::new(db.unwrap_or(HashMap::new()))),
             blocks: Arc::new(Mutex::new(HashMap::new())),
+            subscriptions: Arc::new(RwLock::new(HashMap::new()))
         }
     }
 
