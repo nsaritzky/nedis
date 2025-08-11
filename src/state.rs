@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -166,6 +166,7 @@ pub struct ConnectionState {
     pub transaction_queue: TransactionQueue,
     replica_id: Arc<AtomicUsize>,
     pub stream_tx: mpsc::Sender<Bytes>,
+    subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ConnectionState {
@@ -176,7 +177,8 @@ impl ConnectionState {
             transaction_active: Arc::new(AtomicBool::new(false)),
             transaction_queue: Arc::new(Mutex::new(Vec::new())),
             replica_id: Arc::new(AtomicUsize::new(UNSET)),
-            stream_tx
+            stream_tx,
+            subscriptions: Arc::new(RwLock::new(HashSet::new()))
         }
     }
 
@@ -222,5 +224,15 @@ impl ConnectionState {
     pub async fn queue_command(&mut self, message_len: usize, args: Vec<String>) {
         let mut tq = self.transaction_queue.lock().await;
         tq.push((args, message_len));
+    }
+
+    pub async fn subscribe(&mut self, key: &str) {
+        let mut subs = self.subscriptions.write().await;
+        subs.insert(key.to_string());
+    }
+
+    pub async fn subscription_count(&self) -> usize {
+        let subs = self.subscriptions.read().await;
+        subs.len()
     }
 }

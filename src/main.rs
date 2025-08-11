@@ -373,7 +373,7 @@ async fn execute_command(
         "PSYNC" => handle_psync(server_state, connection_state).await,
         "CONFIG" => handle_config(v),
         "KEYS" => handle_keys(server_state).await,
-        "SUBSCRIBE" => handle_subscribe(v),
+        "SUBSCRIBE" => handle_subscribe(connection_state, v).await,
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -1243,11 +1243,20 @@ async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
     Ok(vec![buf.freeze()])
 }
 
-fn handle_subscribe(v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+async fn handle_subscribe(
+    mut connection_state: ConnectionState,
+    v: &Vec<String>,
+) -> anyhow::Result<Vec<Bytes>> {
     if let Some(key) = v.get(1) {
-        let resp: RedisResponse = vec!["subscribe".into(), key.to_string().into(), 1isize.into()]
-            .into_iter()
-            .collect();
+        connection_state.subscribe(key).await;
+        let sub_count: isize = connection_state.subscription_count().await.try_into().unwrap();
+        let resp: RedisResponse = vec![
+            "subscribe".into(),
+            key.to_string().into(),
+            sub_count.into()
+        ]
+        .into_iter()
+        .collect();
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("SUBSCRIBE: No key provided");
