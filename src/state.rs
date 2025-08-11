@@ -126,7 +126,7 @@ impl ServerState {
         subs.get(key).map(|vec| vec.len()).unwrap_or(0)
     }
 
-    pub async fn publish_subscripiton_message(&self, key: &str, msg: String) -> anyhow::Result<()> {
+    pub async fn publish_subscription_message(&self, key: &str, msg: String) -> anyhow::Result<()> {
         let subs = self.subscriptions.read().await;
         if let Some(senders) = subs.get(key) {
             let futures = senders.iter().map(|tx| {
