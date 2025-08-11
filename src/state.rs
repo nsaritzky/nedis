@@ -39,7 +39,7 @@ pub struct ReplicaState {
 }
 
 impl ServerState {
-    pub fn new(is_master: bool, replica_tx: Option<broadcast::Sender<Bytes>>) -> Self {
+    pub fn new(is_master: bool, replica_tx: Option<broadcast::Sender<Bytes>>, db: Option<HashMap<String, (DbValue, Option<SystemTime>)>>) -> Self {
         ServerState {
             state: if is_master {
                 Either::Left(MasterState::new(
@@ -48,7 +48,7 @@ impl ServerState {
             } else {
                 Either::Right(ReplicaState::new())
             },
-            db: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(db.unwrap_or(HashMap::new()))),
             blocks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -72,7 +72,6 @@ impl ServerState {
         match &self.state {
             Either::Left(_) => bail!("Tried to add to replica offset on the master"),
             Either::Right(replica) => {
-                println!("Adding {message_len} to replica offset");
                 replica.offset.fetch_add(message_len, Ordering::SeqCst);
                 Ok(())
             }

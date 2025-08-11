@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use bytes::Bytes;
 use indexmap::IndexMap;
 
 #[derive(Debug)]
@@ -52,6 +51,12 @@ impl DbValue {
     }
 }
 
+impl From<String> for DbValue {
+    fn from(value: String) -> Self {
+        DbValue::String(value)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamElement {
     pub id: String,
@@ -62,8 +67,4 @@ impl StreamElement {
     pub fn new(id: String, value: IndexMap<String, String>) -> Self {
         StreamElement { id, value }
     }
-}
-
-fn bulk_string(s: &str) -> Bytes {
-    format!("${}\r\n{s}\r\n", s.len()).into()
 }

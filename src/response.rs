@@ -56,30 +56,6 @@ impl FromIterator<RedisResponse> for RedisResponse {
     }
 }
 
-impl From<DbValue> for RedisResponse {
-    fn from(value: DbValue) -> Self {
-        match value {
-            DbValue::String(s) => RedisResponse::Str(s),
-            DbValue::List(arr) => RedisResponse::from_str_vec(&arr.into()),
-            DbValue::Stream(arr) => RedisResponse::List(
-                arr.iter()
-                    .map(|elt| {
-                        RedisResponse::List(vec![
-                            RedisResponse::Str(elt.id.clone()),
-                            RedisResponse::List(
-                                elt.value
-                                    .iter()
-                                    .flat_map(|(k, v)| [k.clone().into(), v.clone().into()])
-                                    .collect(),
-                            ),
-                        ])
-                    })
-                    .collect(),
-            ),
-        }
-    }
-}
-
 impl From<&DbValue> for RedisResponse {
     fn from(value: &DbValue) -> Self {
         match value {

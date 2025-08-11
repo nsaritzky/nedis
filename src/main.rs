@@ -3,6 +3,7 @@ mod db_value;
 mod global_config;
 mod hex;
 mod parser;
+mod rdb_parser;
 mod redis_value;
 mod replica_tracker;
 mod response;
@@ -17,7 +18,7 @@ use std::{
 
 use crate::args::Args;
 use crate::hex::parse_hex_string;
-use crate::parser::*;
+use crate::parser::parse_multiple_resp_arrays_of_strings_with_len;
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
@@ -26,6 +27,7 @@ use global_config::{GlobalConfig, MasterConfig, SlaveConfig};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use num::ToPrimitive;
+use rdb_parser::parse_db;
 use redis_value::{PrimitiveRedisValue, RedisValue};
 use response::RedisResponse;
 use state::{ConnectionState, ConnectionType, ServerState};
@@ -33,7 +35,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{broadcast::error::RecvError, mpsc, Mutex},
+    sync::{broadcast::error::RecvError, mpsc},
     time::interval,
 };
 use tokio::{sync::broadcast, task};
@@ -62,17 +64,44 @@ async fn main() -> anyhow::Result<()> {
     GLOBAL_CONFIG
         .set(if is_master {
             let master_config = MasterConfig::new();
-            GlobalConfig::new_from_master_config(master_config, args.dir, args.dbfilename)
+            GlobalConfig::new_from_master_config(
+                master_config,
+                args.dir.clone(),
+                args.dbfilename.clone(),
+            )
         } else {
             let replicaof = args.replicaof.unwrap();
             let (addr, port) = replicaof.split_once(" ").expect("Invalid replicaof");
             let slave_config =
                 SlaveConfig::new(addr.to_string(), port.parse().expect("Invalid master port"));
-            GlobalConfig::new_from_slave_config(slave_config, args.dir, args.dbfilename)
+            GlobalConfig::new_from_slave_config(
+                slave_config,
+                args.dir.clone(),
+                args.dbfilename.clone(),
+            )
         })
         .map_err(|_| anyhow!("Tried to set global config, but it was already set"))?;
 
     let (replica_tx, _) = broadcast::channel::<Bytes>(32);
+
+    let db = {
+        if let (Some(dir), Some(dbfilename)) = (args.dir, args.dbfilename) {
+            tokio::fs::read(format!("{dir}/{dbfilename}"))
+                .await
+                .ok()
+                .and_then(|data| parse_db(&mut &data[..]).map_err(|e| println!("parsing error: {e:?}")).ok())
+        } else {
+            None
+        }
+    };
+
+    if let Some(ref db) = db {
+        println!("Preexisting db with length {}", db.len());
+    } else {
+        println!("No existing db");
+    }
+
+    println!("db: {db:?}");
 
     let server_state = ServerState::new(
         is_master,
@@ -81,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         },
+        db,
     );
     let loop_server_state = server_state.clone();
 
@@ -328,6 +358,7 @@ async fn execute_command(
         "WAIT" => handle_wait(v, server_state).await,
         "PSYNC" => handle_psync(server_state, connection_state).await,
         "CONFIG" => handle_config(v),
+        "KEYS" => handle_keys(server_state).await,
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -1177,6 +1208,24 @@ fn handle_config(v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
         }
         cmd => bail!("CONFIG: invalid command: {cmd}"),
     }
+}
+
+async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
+    let mut db = server_state.db.lock().await;
+    let mut buf = BytesMut::new();
+    let mut values_buf = BytesMut::new();
+    let now = SystemTime::now();
+    db.retain(|k, (_, expires)| {
+        if expires.is_none_or(|exp| exp >= now) {
+            values_buf.extend_from_slice(&RedisResponse::Str(k.clone()).to_bytes());
+            true
+        } else {
+            false
+        }
+    });
+    buf.extend_from_slice(format!("*{}\r\n", db.len()).as_bytes());
+    buf.extend_from_slice(&values_buf);
+    Ok(vec![buf.freeze()])
 }
 
 fn gather_stream_read_results<'a>(
