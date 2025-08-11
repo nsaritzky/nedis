@@ -294,6 +294,8 @@ async fn process_input(
             )
             .await?;
 
+            println!("Processing command: {v:?}, Connection type: {:?}", connection_state.get_connection_type());
+
             let should_send_response =
                 if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster {
                     match (v.get(0), v.get(1)) {
@@ -308,6 +310,8 @@ async fn process_input(
                 } else {
                     true
                 };
+
+            println!("Should send response: {should_send_response}, command: {v:?}");
 
             if should_send_response {
                 for resp in responses {
