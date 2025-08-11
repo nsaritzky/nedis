@@ -11,11 +11,11 @@ use anyhow::{anyhow, bail};
 use atomic_enum::atomic_enum;
 use bytes::Bytes;
 use either::Either;
-use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard};
+use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
 use crate::{db_value::DbValue, replica_tracker::ReplicaTracker};
 
-type Db = Arc<Mutex<HashMap<String, (DbValue, Option<SystemTime>)>>>;
+type Db = Arc<RwLock<HashMap<String, (DbValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
 type TransactionQueue = Arc<Mutex<Vec<(Vec<String>, usize)>>>;
 
@@ -48,7 +48,7 @@ impl ServerState {
             } else {
                 Either::Right(ReplicaState::new())
             },
-            db: Arc::new(Mutex::new(db.unwrap_or(HashMap::new()))),
+            db: Arc::new(RwLock::new(db.unwrap_or(HashMap::new()))),
             blocks: Arc::new(Mutex::new(HashMap::new())),
         }
     }

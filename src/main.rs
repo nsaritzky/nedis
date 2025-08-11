@@ -411,7 +411,7 @@ async fn handle_set(server_state: ServerState, v: &mut Vec<String>) -> anyhow::R
     };
 
     if let (Some(key), Some(value)) = (key, value) {
-        let mut db = server_state.db.lock().await;
+        let mut db = server_state.db.write().await;
 
         match v.get(1) {
             Some(s) if s.to_ascii_uppercase() == "PX" => {
@@ -437,7 +437,7 @@ async fn handle_set(server_state: ServerState, v: &mut Vec<String>) -> anyhow::R
 async fn handle_get(server_state: ServerState, v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
     let key = &v[1];
 
-    let mut db = server_state.db.lock().await;
+    let mut db = server_state.db.write().await;
 
     if let Some((value, expiry)) = db.get(key) {
         if let Some(expiry) = expiry {
@@ -466,7 +466,7 @@ async fn handle_rpush(
     };
 
     if let Some(key) = key {
-        let mut db = server_state.db.lock().await;
+        let mut db = server_state.db.write().await;
 
         if let Some((DbValue::List(ref mut array), _)) = db.get_mut(&key) {
             array.append(&mut values.into());
@@ -495,7 +495,7 @@ async fn handle_lrange(
     let empty_array_response = RedisResponse::List(vec![]).to_bytes();
     let key = &v[*i];
 
-    let db = server_state.db.lock().await;
+    let db = server_state.db.read().await;
 
     if let Some((DbValue::List(array), _)) = db.get(key) {
         if let (Some(a), Some(b)) = (v.get(*i + 1), v.get(*i + 2)) {
@@ -550,7 +550,7 @@ async fn handle_lpush(
     };
 
     if let Some(key) = key {
-        let mut db = server_state.db.lock().await;
+        let mut db = server_state.db.write().await;
 
         if let Some((DbValue::List(ref mut array), _)) = db.get_mut(&key) {
             values.append(array);
@@ -573,7 +573,7 @@ async fn handle_llen(
     *i += 1;
 
     let key = &v[*i];
-    let db = server_state.db.lock().await;
+    let db = server_state.db.read().await;
 
     if let Some((DbValue::List(array), _)) = db.get(key) {
         let size = array.len().to_isize().unwrap();
@@ -596,7 +596,7 @@ async fn handle_lpop(
     *i += 1;
 
     let key = &v[*i];
-    let mut db = server_state.db.lock().await;
+    let mut db = server_state.db.write().await;
 
     if let Some((DbValue::List(ref mut array), _)) = db.get_mut(key) {
         if let Some(n) = v.get(*i + 1) {
@@ -672,7 +672,7 @@ async fn handle_blpop(
             }
         }
 
-        let mut db = server_state.db.lock().await;
+        let mut db = server_state.db.write().await;
         if let Some((DbValue::List(ref mut array), _)) = db.get_mut(key) {
             if !array.is_empty() {
                 let mut blocks = server_state.blocks.lock().await;
@@ -708,7 +708,7 @@ async fn handle_type(
     *i += 1;
 
     if let Some(key) = v.get(*i) {
-        let db = server_state.db.lock().await;
+        let db = server_state.db.read().await;
 
         match db.get(key) {
             Some((DbValue::String(_), _)) | Some((DbValue::List(_), _)) => {
@@ -730,7 +730,7 @@ async fn handle_xadd(
     *i += 1;
 
     if let Some(key) = v.get(*i) {
-        let mut db = server_state.db.lock().await;
+        let mut db = server_state.db.write().await;
 
         let stream_vec = if let Some((DbValue::Stream(stream_vec), _)) = db.get_mut(key) {
             stream_vec
@@ -786,7 +786,7 @@ async fn handle_xrange(
     *i += 1;
 
     if let Some(key) = v.get(*i) {
-        let db = server_state.db.lock().await;
+        let db = server_state.db.read().await;
 
         if let Some((DbValue::Stream(stream_vec), _)) = db.get(key) {
             let mut drain = v.drain(*i + 1..*i + 3);
@@ -887,7 +887,7 @@ async fn handle_xread(
             let start = &v[*i + 2];
 
             let (start_timestamp, start_sequence) = {
-                let db = server_state.db.lock().await;
+                let db = server_state.db.read().await;
                 parse_id_with_dollar_sign(
                     &start,
                     db.get(key).and_then(|(val, _)| val.to_stream_vec()),
@@ -901,7 +901,7 @@ async fn handle_xread(
                     return Ok(vec!["$-1\r\n".into()]);
                 }
 
-                if let Ok(db) = server_state.db.try_lock() {
+                if let Ok(db) = server_state.db.try_read() {
                     if let Some((DbValue::Stream(stream_vec), _)) = db.get(key) {
                         if let Some(last) = stream_vec.last() {
                             let (timestamp, sequence) = parse_id(&last.id);
@@ -939,7 +939,7 @@ async fn handle_xread(
 
     *i += 1;
 
-    let db = server_state.db.lock().await;
+    let db = server_state.db.read().await;
 
     let mut keys = Vec::new();
 
@@ -990,7 +990,7 @@ async fn handle_incr(
 
     let key = &v[*i];
 
-    let mut db = server_state.db.lock().await;
+    let mut db = server_state.db.write().await;
 
     let updated_int = match db.entry(key.clone()) {
         Entry::Occupied(mut occ) => {
@@ -1215,7 +1215,7 @@ fn handle_config(v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
 }
 
 async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
-    let mut db = server_state.db.lock().await;
+    let mut db = server_state.db.write().await;
     let mut buf = BytesMut::new();
     let mut values_buf = BytesMut::new();
     let now = SystemTime::now();
