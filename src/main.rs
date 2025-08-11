@@ -89,7 +89,11 @@ async fn main() -> anyhow::Result<()> {
             tokio::fs::read(format!("{dir}/{dbfilename}"))
                 .await
                 .ok()
-                .and_then(|data| parse_db(&mut &data[..]).map_err(|e| println!("parsing error: {e:?}")).ok())
+                .and_then(|data| {
+                    parse_db(&mut &data[..])
+                        .map_err(|e| println!("parsing error: {e:?}"))
+                        .ok()
+                })
         } else {
             None
         }
@@ -247,7 +251,7 @@ async fn process(
     }
 
     let _ = writer.await;
-    println!("Killed!");
+
     Ok(())
 }
 
@@ -297,7 +301,10 @@ async fn process_input(
             )
             .await?;
 
-            println!("Processing command: {v:?}, Connection type: {:?}", connection_state.get_connection_type());
+            println!(
+                "Processing command: {v:?}, Connection type: {:?}",
+                connection_state.get_connection_type()
+            );
 
             let should_send_response =
                 if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster {
@@ -366,6 +373,7 @@ async fn execute_command(
         "PSYNC" => handle_psync(server_state, connection_state).await,
         "CONFIG" => handle_config(v),
         "KEYS" => handle_keys(server_state).await,
+        "SUBSCRIBE" => handle_subscribe(v),
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -1233,6 +1241,17 @@ async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
     buf.extend_from_slice(format!("*{}\r\n", db.len()).as_bytes());
     buf.extend_from_slice(&values_buf);
     Ok(vec![buf.freeze()])
+}
+
+fn handle_subscribe(v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+    if let Some(key) = v.get(1) {
+        let resp: RedisResponse = vec!["subscribe".into(), key.to_string().into(), 1isize.into()]
+            .into_iter()
+            .collect();
+        Ok(vec![resp.to_bytes()])
+    } else {
+        bail!("SUBSCRIBE: No key provided");
+    }
 }
 
 fn gather_stream_read_results<'a>(

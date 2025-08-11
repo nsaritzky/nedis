@@ -109,3 +109,15 @@ impl From<String> for RedisResponse {
         RedisResponse::Str(value)
     }
 }
+
+impl From<&str> for RedisResponse {
+    fn from(value: &str) -> Self {
+        RedisResponse::Str(value.to_string())
+    }
+}
+
+impl From<isize> for RedisResponse {
+    fn from(value: isize) -> Self {
+        RedisResponse::Int(value)
+    }
+}
