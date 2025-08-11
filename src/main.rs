@@ -7,8 +7,8 @@ mod rdb_parser;
 mod redis_value;
 mod replica_tracker;
 mod response;
-mod state;
 mod shard_map;
+mod state;
 
 use std::{
     collections::{hash_map::Entry, BTreeSet, VecDeque},
@@ -389,7 +389,8 @@ async fn execute_command(
         "PSYNC" => handle_psync(server_state, connection_state).await,
         "CONFIG" => handle_config(v),
         "KEYS" => handle_keys(server_state).await,
-        "SUBSCRIBE" => handle_subscribe(connection_state, v).await,
+        "SUBSCRIBE" => handle_subscribe(server_state, connection_state, v).await,
+        "PUBLISH" => handle_publish(server_state, v).await,
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -433,7 +434,9 @@ async fn expect_response(stream: &mut TcpStream, expected_response: &[u8]) -> an
 
 fn handle_ping(connection_state: ConnectionState) -> anyhow::Result<Vec<Bytes>> {
     if connection_state.get_subscribe_mode() {
-        Ok(vec![RedisResponse::List(vec!["pong".into(), "".into()]).to_bytes()])
+        Ok(vec![
+            RedisResponse::List(vec!["pong".into(), "".into()]).to_bytes()
+        ])
     } else {
         Ok(vec!["+PONG\r\n".into()])
     }
@@ -1268,11 +1271,14 @@ async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
 }
 
 async fn handle_subscribe(
+    mut server_state: ServerState,
     mut connection_state: ConnectionState,
     v: &Vec<String>,
 ) -> anyhow::Result<Vec<Bytes>> {
     if let Some(key) = v.get(1) {
-        connection_state.subscribe(key).await;
+        if connection_state.subscribe(key).await {
+            server_state.add_subscription(key.to_string());
+        }
         let sub_count: isize = connection_state
             .subscription_count()
             .await
@@ -1285,6 +1291,18 @@ async fn handle_subscribe(
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("SUBSCRIBE: No key provided");
+    }
+}
+
+async fn handle_publish(
+    server_state: ServerState,
+    v: &Vec<String>,
+) -> anyhow::Result<Vec<Bytes>> {
+    if let Some(key) = v.get(1) {
+        let count: isize = server_state.get_subscripiton_count(key).await.try_into().unwrap();
+        Ok(vec![RedisResponse::from(count).to_bytes()])
+    } else {
+        Ok(vec![":0\r\n".into()])
     }
 }
 

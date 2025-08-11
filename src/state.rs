@@ -104,6 +104,16 @@ impl ServerState {
             Either::Right(replica) => replica.offset.load(Ordering::SeqCst),
         }
     }
+
+    pub async fn add_subscription(&mut self, key: String) {
+        let mut subs = self.subscriptions.write().await;
+        subs.entry(key).and_modify(|n| *n += 1).or_insert(1);
+    }
+
+    pub async fn get_subscripiton_count(&self, key: &str) -> usize {
+        let subs = self.subscriptions.read().await;
+        *subs.get(key).unwrap_or(&0)
+    }
 }
 
 impl MasterState {
@@ -231,10 +241,10 @@ impl ConnectionState {
         tq.push((args, message_len));
     }
 
-    pub async fn subscribe(&mut self, key: &str) {
+    pub async fn subscribe(&mut self, key: &str) -> bool {
         let mut subs = self.subscriptions.write().await;
         self.subscribed_mode.store(true, Ordering::Relaxed);
-        subs.insert(key.to_string());
+        subs.insert(key.to_string())
     }
 
     pub async fn subscription_count(&self) -> usize {
