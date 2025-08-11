@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail};
 use atomic_enum::atomic_enum;
 use bytes::Bytes;
 use either::Either;
+use futures::future::join_all;
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
 use crate::{db_value::DbValue, replica_tracker::ReplicaTracker};
@@ -18,7 +19,7 @@ use crate::{db_value::DbValue, replica_tracker::ReplicaTracker};
 type Db = Arc<RwLock<HashMap<String, (DbValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
 type TransactionQueue = Arc<Mutex<Vec<(Vec<String>, usize)>>>;
-type Subscriptions = Arc<RwLock<HashMap<String, usize>>>;
+type Subscriptions = Arc<RwLock<HashMap<String, Vec<broadcast::Sender<String>>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ServerState {
@@ -26,6 +27,7 @@ pub struct ServerState {
     pub db: Db,
     pub blocks: Blocks,
     subscriptions: Subscriptions,
+    next_connection_id: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +43,11 @@ pub struct ReplicaState {
 }
 
 impl ServerState {
-    pub fn new(is_master: bool, replica_tx: Option<broadcast::Sender<Bytes>>, db: Option<HashMap<String, (DbValue, Option<SystemTime>)>>) -> Self {
+    pub fn new(
+        is_master: bool,
+        replica_tx: Option<broadcast::Sender<Bytes>>,
+        db: Option<HashMap<String, (DbValue, Option<SystemTime>)>>,
+    ) -> Self {
         ServerState {
             state: if is_master {
                 Either::Left(MasterState::new(
@@ -52,7 +58,8 @@ impl ServerState {
             },
             db: Arc::new(RwLock::new(db.unwrap_or(HashMap::new()))),
             blocks: Arc::new(Mutex::new(HashMap::new())),
-            subscriptions: Arc::new(RwLock::new(HashMap::new()))
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            next_connection_id: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -105,14 +112,41 @@ impl ServerState {
         }
     }
 
-    pub async fn add_subscription(&mut self, key: String) {
+    pub async fn add_subscription(&mut self, key: String, tx: broadcast::Sender<String>) {
         let mut subs = self.subscriptions.write().await;
-        subs.entry(key).and_modify(|n| *n += 1).or_insert(1);
+        subs.entry(key)
+            .and_modify(|arr| {
+                arr.push(tx.clone());
+            })
+            .or_insert(vec![tx.clone()]);
     }
 
     pub async fn get_subscripiton_count(&self, key: &str) -> usize {
         let subs = self.subscriptions.read().await;
-        *subs.get(key).unwrap_or(&0)
+        subs.get(key).map(|vec| vec.len()).unwrap_or(0)
+    }
+
+    pub async fn publish_subscripiton_message(&self, key: &str, msg: String) -> anyhow::Result<()> {
+        let subs = self.subscriptions.read().await;
+        if let Some(senders) = subs.get(key) {
+            let futures = senders.iter().map(|tx| {
+                let msg = msg.clone();
+                async move { tx.send(msg) }
+            });
+            let results = join_all(futures).await;
+            let failures = results.into_iter().filter(|res| res.is_err()).count();
+            if failures > 0 {
+                bail!("Failed to send subsrciption message {msg} to {failures} receivers");
+            } else {
+                Ok(())
+            }
+        } else {
+            bail!("Subscripion key error: {key}");
+        }
+    }
+
+    pub fn get_connection_id(&mut self) -> usize {
+        self.next_connection_id.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -166,7 +200,7 @@ impl ReplicaState {
 pub enum ConnectionType {
     Client,
     MasterToReplica,
-    ReplicaToMaster
+    ReplicaToMaster,
 }
 
 const UNSET: usize = usize::MAX;
@@ -174,6 +208,7 @@ const UNSET: usize = usize::MAX;
 #[derive(Clone, Debug)]
 pub struct ConnectionState {
     is_master: bool,
+    id: usize,
     connection_type: Arc<AtomicConnectionType>,
     transaction_active: Arc<AtomicBool>,
     pub transaction_queue: TransactionQueue,
@@ -184,21 +219,23 @@ pub struct ConnectionState {
 }
 
 impl ConnectionState {
-    pub fn new(stream_tx: mpsc::Sender<Bytes>, is_master: bool) -> Self {
+    pub fn new(stream_tx: mpsc::Sender<Bytes>, is_master: bool, id: usize) -> Self {
         ConnectionState {
             is_master,
+            id,
             connection_type: Arc::new(AtomicConnectionType::new(ConnectionType::Client)),
             transaction_active: Arc::new(AtomicBool::new(false)),
             transaction_queue: Arc::new(Mutex::new(Vec::new())),
             replica_id: Arc::new(AtomicUsize::new(UNSET)),
             stream_tx,
             subscriptions: Arc::new(RwLock::new(HashSet::new())),
-            subscribed_mode: Arc::new(AtomicBool::new(false))
+            subscribed_mode: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn set_connection_type(&mut self, connection_type: ConnectionType) {
-        self.connection_type.store(connection_type, Ordering::Relaxed);
+        self.connection_type
+            .store(connection_type, Ordering::Relaxed);
     }
 
     pub fn get_connection_type(&self) -> ConnectionType {
@@ -227,7 +264,7 @@ impl ConnectionState {
     pub fn get_replica_id(&self) -> Option<usize> {
         match self.replica_id.load(Ordering::Relaxed) {
             UNSET => None,
-            id => Some(id)
+            id => Some(id),
         }
     }
 
@@ -241,15 +278,10 @@ impl ConnectionState {
         tq.push((args, message_len));
     }
 
-    pub async fn subscribe(&mut self, key: &str) -> bool {
+    pub async fn subscribe(&mut self, key: String) -> (bool, isize) {
         let mut subs = self.subscriptions.write().await;
         self.subscribed_mode.store(true, Ordering::Relaxed);
-        subs.insert(key.to_string())
-    }
-
-    pub async fn subscription_count(&self) -> usize {
-        let subs = self.subscriptions.read().await;
-        subs.len()
+        (subs.insert(key), subs.len().try_into().unwrap())
     }
 
     pub fn get_subscribe_mode(&self) -> bool {

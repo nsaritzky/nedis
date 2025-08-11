@@ -114,8 +114,6 @@ async fn main() -> anyhow::Result<()> {
         println!("No existing db");
     }
 
-    println!("db: {db:?}");
-
     let server_state = ServerState::new(
         is_master,
         if is_master {
@@ -193,7 +191,11 @@ async fn process(
     let (mut stream_reader, mut stream_writer) = stream.into_split();
     let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(100);
 
-    let mut connection_state = ConnectionState::new(stream_tx.clone(), server_state.is_master());
+    let mut connection_state = ConnectionState::new(
+        stream_tx.clone(),
+        server_state.is_master(),
+        server_state.get_connection_id(),
+    );
     if is_replication_conn {
         connection_state.set_connection_type(ConnectionType::ReplicaToMaster);
     }
@@ -217,7 +219,6 @@ async fn process(
                 match input_len {
                     Ok(0) => break,
                     Ok(n) => {
-                        println!("Received {}", String::from_utf8_lossy(&buf[..n]));
                         if n >= EMPTY_RDB_BYTES.len() &&
                             (buf[..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES) {
                                 let _ = buf.split_to(EMPTY_RDB_BYTES.len());
@@ -226,8 +227,6 @@ async fn process(
                             }
                         let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
                             .map_err(|e| anyhow!(e))?;
-
-                        println!("Received commands: {results:?}");
 
                         let server_state = server_state.clone();
                         let connection_state = connection_state.clone();
@@ -317,11 +316,6 @@ async fn process_input(
                 .await?
             };
 
-            println!(
-                "Processing command: {v:?}, Connection type: {:?}",
-                connection_state.get_connection_type()
-            );
-
             let should_send_response =
                 if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster {
                     match (v.get(0), v.get(1)) {
@@ -336,8 +330,6 @@ async fn process_input(
                 } else {
                     true
                 };
-
-            println!("Should send response: {should_send_response}, command: {v:?}");
 
             if should_send_response {
                 for resp in responses {
@@ -1276,33 +1268,57 @@ async fn handle_subscribe(
     v: &Vec<String>,
 ) -> anyhow::Result<Vec<Bytes>> {
     if let Some(key) = v.get(1) {
-        if connection_state.subscribe(key).await {
-            server_state.add_subscription(key.to_string()).await;
+        let (newly_inserted, sub_count) = connection_state.subscribe(key.to_string()).await;
+        let resp = RedisResponse::List(vec![
+            "subscribe".into(),
+            key.to_string().into(),
+            sub_count.into(),
+        ]);
+        if newly_inserted {
+            let (tx, mut rx) = broadcast::channel::<String>(100);
+            server_state.add_subscription(key.to_string(), tx).await;
+            let key_clone = key.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            let resp = RedisResponse::List(vec![
+                                "message".into(),
+                                key_clone.clone().into(),
+                                msg.into(),
+                            ]);
+                            if let Err(e) = connection_state.stream_tx.send(resp.to_bytes()).await {
+                                println!("Error sending subscription message to stream: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error receiving subscripiton message: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
         }
-        let sub_count: isize = connection_state
-            .subscription_count()
-            .await
-            .try_into()
-            .unwrap();
-        let resp: RedisResponse =
-            vec!["subscribe".into(), key.to_string().into(), sub_count.into()]
-                .into_iter()
-                .collect();
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("SUBSCRIBE: No key provided");
     }
 }
 
-async fn handle_publish(
-    server_state: ServerState,
-    v: &Vec<String>,
-) -> anyhow::Result<Vec<Bytes>> {
-    if let Some(key) = v.get(1) {
-        let count: isize = server_state.get_subscripiton_count(key).await.try_into().unwrap();
+async fn handle_publish(server_state: ServerState, v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+    if let (Some(key), Some(msg)) = (v.get(1), v.get(2)) {
+        let count: isize = server_state
+            .get_subscripiton_count(key)
+            .await
+            .try_into()
+            .unwrap();
+        server_state
+            .publish_subscription_message(key, msg.to_string())
+            .await?;
         Ok(vec![RedisResponse::from(count).to_bytes()])
     } else {
-        Ok(vec![":0\r\n".into()])
+        bail!("PUBLISH: key or message not provided");
     }
 }
 
