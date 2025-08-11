@@ -363,7 +363,7 @@ async fn execute_command(
     println!("Command: {}", v[0]);
     let mut i = 0;
     match v[0].to_ascii_uppercase().as_str() {
-        "PING" => Ok(vec!["+PONG\r\n".into()]),
+        "PING" => handle_ping(connection_state),
         "ECHO" => Ok(vec![bulk_string(&v[1])]),
         "SET" => handle_set(server_state, v).await,
         "GET" => handle_get(server_state, v).await,
@@ -426,6 +426,14 @@ async fn expect_response(stream: &mut TcpStream, expected_response: &[u8]) -> an
             "Did not receive expected response {}. Got {buf:?}, instead.",
             String::from_utf8_lossy(expected_response)
         )
+    }
+}
+
+fn handle_ping(connection_state: ConnectionState) -> anyhow::Result<Vec<Bytes>> {
+    if connection_state.get_subscribe_mode() {
+        Ok(vec![RedisResponse::List(vec!["PONG".into(), "".into()]).to_bytes()])
+    } else {
+        Ok(vec!["+PONG\r\n".into()])
     }
 }
 
