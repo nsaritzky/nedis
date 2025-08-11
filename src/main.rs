@@ -31,7 +31,7 @@ use num::ToPrimitive;
 use rdb_parser::parse_db;
 use redis_value::{PrimitiveRedisValue, RedisValue};
 use response::RedisResponse;
-use state::{ConnectionState, ConnectionType, ServerState};
+use state::{ConnectionState, ConnectionType, ServerState, SubscriptionMessage};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -383,6 +383,7 @@ async fn execute_command(
         "KEYS" => handle_keys(server_state).await,
         "SUBSCRIBE" => handle_subscribe(server_state, connection_state, v).await,
         "PUBLISH" => handle_publish(server_state, v).await,
+        "UNSUBSCRIBE" => handle_unsubscribe(connection_state, v).await,
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -1268,20 +1269,26 @@ async fn handle_subscribe(
     v: &Vec<String>,
 ) -> anyhow::Result<Vec<Bytes>> {
     if let Some(key) = v.get(1) {
-        let (newly_inserted, sub_count) = connection_state.subscribe(key.to_string()).await;
+        let (newly_inserted, tx, sub_count) = connection_state.subscribe(key.to_string()).await;
         let resp = RedisResponse::List(vec![
             "subscribe".into(),
             key.to_string().into(),
             sub_count.into(),
         ]);
         if newly_inserted {
-            let (tx, mut rx) = broadcast::channel::<String>(100);
-            server_state.add_subscription(key.to_string(), tx).await;
+            server_state
+                .add_subscription(
+                    key.to_string(),
+                    connection_state.get_connection_id(),
+                    tx.clone(),
+                )
+                .await;
             let key_clone = key.clone();
+            let mut rx = tx.subscribe();
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(msg) => {
+                        Ok(SubscriptionMessage::Message(msg)) => {
                             let resp = RedisResponse::List(vec![
                                 "message".into(),
                                 key_clone.clone().into(),
@@ -1291,6 +1298,15 @@ async fn handle_subscribe(
                                 println!("Error sending subscription message to stream: {e}");
                                 break;
                             }
+                        }
+                        Ok(SubscriptionMessage::Unsubscribe) => {
+                            server_state
+                                .remove_subscription(
+                                    key_clone,
+                                    connection_state.get_connection_id(),
+                                )
+                                .await;
+                            break;
                         }
                         Err(e) => {
                             println!("Error receiving subscripiton message: {e}");
@@ -1303,6 +1319,25 @@ async fn handle_subscribe(
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("SUBSCRIBE: No key provided");
+    }
+}
+
+async fn handle_unsubscribe(
+    mut connection_state: ConnectionState,
+    v: &Vec<String>,
+) -> anyhow::Result<Vec<Bytes>> {
+    if let Some(key) = v.get(1) {
+        let count = match connection_state.remove_subscription(key).await {
+            (Some(tx), count) => {
+                tx.send(SubscriptionMessage::Unsubscribe)?;
+                count
+            },
+            (None, count) => count
+        } as isize;
+        let resp = RedisResponse::List(vec!["unsubscribe".into(), key.to_string().into(), count.into()]);
+        Ok(vec![resp.to_bytes()])
+    } else {
+        bail!("UNSUBSCRIBE: no key provided")
     }
 }
 

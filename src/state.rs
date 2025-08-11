@@ -19,7 +19,10 @@ use crate::{db_value::DbValue, replica_tracker::ReplicaTracker};
 type Db = Arc<RwLock<HashMap<String, (DbValue, Option<SystemTime>)>>>;
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
 type TransactionQueue = Arc<Mutex<Vec<(Vec<String>, usize)>>>;
-type Subscriptions = Arc<RwLock<HashMap<String, Vec<broadcast::Sender<String>>>>>;
+type Subscriptions =
+    Arc<RwLock<HashMap<String, Vec<(broadcast::Sender<SubscriptionMessage>, usize)>>>>;
+
+type Channel<T> = (broadcast::Sender<T>, broadcast::Receiver<T>);
 
 #[derive(Debug, Clone)]
 pub struct ServerState {
@@ -112,13 +115,29 @@ impl ServerState {
         }
     }
 
-    pub async fn add_subscription(&mut self, key: String, tx: broadcast::Sender<String>) {
+    pub async fn add_subscription(
+        &mut self,
+        key: String,
+        connection_id: usize,
+        tx: broadcast::Sender<SubscriptionMessage>,
+    ) {
         let mut subs = self.subscriptions.write().await;
         subs.entry(key)
             .and_modify(|arr| {
-                arr.push(tx.clone());
+                arr.push((tx.clone(), connection_id));
             })
-            .or_insert(vec![tx.clone()]);
+            .or_insert(vec![(tx.clone(), connection_id)]);
+    }
+
+    pub async fn remove_subscription(&mut self, key: String, connection_id: usize) {
+        let mut subs = self.subscriptions.write().await;
+        if let Entry::Occupied(mut occ) = subs.entry(key) {
+            let senders = occ.get_mut();
+            senders.retain(|(_, conn_id)| connection_id != *conn_id);
+            if senders.is_empty() {
+                occ.remove();
+            }
+        }
     }
 
     pub async fn get_subscripiton_count(&self, key: &str) -> usize {
@@ -129,9 +148,9 @@ impl ServerState {
     pub async fn publish_subscription_message(&self, key: &str, msg: String) -> anyhow::Result<()> {
         let subs = self.subscriptions.read().await;
         if let Some(senders) = subs.get(key) {
-            let futures = senders.iter().map(|tx| {
+            let futures = senders.iter().map(|(tx, _)| {
                 let msg = msg.clone();
-                async move { tx.send(msg) }
+                async move { tx.send(SubscriptionMessage::Message(msg)) }
             });
             let results = join_all(futures).await;
             let failures = results.into_iter().filter(|res| res.is_err()).count();
@@ -214,8 +233,8 @@ pub struct ConnectionState {
     pub transaction_queue: TransactionQueue,
     replica_id: Arc<AtomicUsize>,
     pub stream_tx: mpsc::Sender<Bytes>,
-    subscriptions: Arc<RwLock<HashSet<String>>>,
-    subscribed_mode: Arc<AtomicBool>
+    subscriptions: Arc<RwLock<HashMap<String, broadcast::Sender<SubscriptionMessage>>>>,
+    subscribed_mode: Arc<AtomicBool>,
 }
 
 impl ConnectionState {
@@ -228,7 +247,7 @@ impl ConnectionState {
             transaction_queue: Arc::new(Mutex::new(Vec::new())),
             replica_id: Arc::new(AtomicUsize::new(UNSET)),
             stream_tx,
-            subscriptions: Arc::new(RwLock::new(HashSet::new())),
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
             subscribed_mode: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -278,13 +297,42 @@ impl ConnectionState {
         tq.push((args, message_len));
     }
 
-    pub async fn subscribe(&mut self, key: String) -> (bool, isize) {
+    pub async fn subscribe(
+        &mut self,
+        key: String,
+    ) -> (bool, broadcast::Sender<SubscriptionMessage>, isize) {
         let mut subs = self.subscriptions.write().await;
         self.subscribed_mode.store(true, Ordering::Relaxed);
-        (subs.insert(key), subs.len().try_into().unwrap())
+        let count = subs.len();
+        match subs.entry(key) {
+            Entry::Occupied(e) => (false, e.get().clone(), count as isize),
+            Entry::Vacant(vac) => {
+                let (tx, _) = broadcast::channel::<SubscriptionMessage>(100);
+                vac.insert(tx.clone());
+                (true, tx, count as isize + 1)
+            }
+        }
+    }
+
+    pub async fn remove_subscription(
+        &mut self,
+        key: &str,
+    ) -> (Option<broadcast::Sender<SubscriptionMessage>>, usize) {
+        let mut subs = self.subscriptions.write().await;
+        (subs.remove(key), subs.len())
     }
 
     pub fn get_subscribe_mode(&self) -> bool {
         self.subscribed_mode.load(Ordering::Relaxed)
     }
+
+    pub fn get_connection_id(&self) -> usize {
+        self.id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum SubscriptionMessage {
+    Message(String),
+    Unsubscribe,
 }
