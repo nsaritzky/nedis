@@ -247,6 +247,7 @@ async fn process(
     }
 
     let _ = writer.await;
+    println!("Killed!");
     Ok(())
 }
 
