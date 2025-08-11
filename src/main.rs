@@ -9,7 +9,6 @@ mod replica_tracker;
 mod response;
 mod state;
 mod shard_map;
-mod value_guard;
 
 use std::{
     collections::{hash_map::Entry, BTreeSet, VecDeque},
