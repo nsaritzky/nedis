@@ -8,6 +8,8 @@ mod redis_value;
 mod replica_tracker;
 mod response;
 mod state;
+mod shard_map;
+mod value_guard;
 
 use std::{
     collections::{hash_map::Entry, BTreeSet, VecDeque},
@@ -216,6 +218,7 @@ async fn process(
                 match input_len {
                     Ok(0) => break,
                     Ok(n) => {
+                        println!("Received {}", String::from_utf8_lossy(&buf[..n]));
                         if n >= EMPTY_RDB_BYTES.len() &&
                             (buf[..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES) {
                                 let _ = buf.split_to(EMPTY_RDB_BYTES.len());
