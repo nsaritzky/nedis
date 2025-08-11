@@ -213,6 +213,8 @@ async fn process(
                         let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
                             .map_err(|e| anyhow!(e))?;
 
+                        println!("Received commands: {results:?}");
+
                         let server_state = server_state.clone();
                         let connection_state = connection_state.clone();
 
