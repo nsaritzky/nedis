@@ -1,13 +1,17 @@
+#![allow(dead_code)]
 use std::{
-    borrow::Borrow, collections::{hash_map, HashMap}, future::Future, hash::{DefaultHasher, Hash, Hasher}, pin::Pin, sync::{atomic::{AtomicUsize, Ordering}, Arc}, task::{Context, Poll}
+    borrow::Borrow, collections::{hash_map::{self, OccupiedEntry}, HashMap}, future::Future, hash::{DefaultHasher, Hash, Hasher}, ops::{Deref, DerefMut, Sub}, sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    }
 };
 
-use tokio::{pin, sync::{RwLock, RwLockReadGuard, RwLockWriteGuard}};
-use tokio_stream::Stream;
+use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 
+#[derive(Debug, Clone)]
 pub struct ShardMap<K, V> {
     shard_count: usize,
-    size: AtomicUsize,
+    size: Arc<AtomicUsize>,
     maps: Box<[Arc<RwLock<HashMap<K, V>>>]>,
 }
 
@@ -15,7 +19,7 @@ impl<K, V> ShardMap<K, V> {
     pub fn new(shard_count: usize) -> Self {
         ShardMap {
             shard_count,
-            size: AtomicUsize::new(0),
+            size: Arc::new(AtomicUsize::new(0)),
             maps: (0..shard_count)
                 .map(|_| Arc::new(RwLock::new(HashMap::new())))
                 .collect::<Vec<_>>()
@@ -32,6 +36,24 @@ impl<K, V> ShardMap<K, V>
 where
     K: Eq + Hash,
 {
+    pub fn from_hash_map(shard_count: usize, map: HashMap<K, V>) -> Self {
+        let mut maps = (0..shard_count).map(|_| HashMap::new()).collect::<Vec<_>>();
+        let size = map.len();
+        for (k, v) in map {
+            let bucket_index = Self::get_index_for_key(shard_count as u64, &k);
+            maps[bucket_index].insert(k, v);
+        }
+        Self {
+            shard_count,
+            size: Arc::new(AtomicUsize::new(size)),
+            maps: maps
+                .into_iter()
+                .map(|m| Arc::new(RwLock::new(m)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
     pub async fn with_value<R, F, Q>(&self, key: &Q, f: F) -> Option<R>
     where
         K: Borrow<Q>,
@@ -48,14 +70,19 @@ where
         Q: Eq + Hash + ?Sized,
     {
         let guard = self.get_bucket(key).await;
-        if guard.contains_key(key) {
-            Some(RwLockReadGuard::map(guard, |m| &m[key]))
-        } else {
-            None
-        }
+        RwLockReadGuard::try_map(guard, |m| m.get(key)).ok()
     }
 
-    pub async fn insert<Q>(&mut self, key: K, value: V) -> Option<V> {
+    pub async fn get_mut<Q>(&mut self, key: &Q) -> Option<RwLockMappedWriteGuard<V>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let guard = self.get_bucket_mut(key).await;
+        RwLockWriteGuard::try_map(guard, |m| m.get_mut(key)).ok()
+    }
+
+    pub async fn insert(&mut self, key: K, value: V) -> Option<V> {
         let mut map = self.get_bucket_mut(&key).await;
         let res = map.insert(key, value);
         if res.is_none() {
@@ -64,13 +91,26 @@ where
         res
     }
 
-    pub async fn remove<Q>(&mut self, key: K) -> Option<V> {
+    pub async fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
         let mut map = self.get_bucket_mut(&key).await;
         let res = map.remove(&key);
         if res.is_some() {
             self.size.fetch_sub(1, Ordering::Relaxed);
         }
         res
+    }
+
+    pub async fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let map = self.get_bucket(key).await;
+        map.contains_key(key)
     }
 
     pub fn len(&self) -> usize {
@@ -81,15 +121,30 @@ where
         self.shard_count
     }
 
+    pub async fn with_entry<F, R>(&mut self, key: K, f: F) -> R
+    where
+        F: FnOnce(hash_map::Entry<K, V>) -> R,
+    {
+        let mut guard = self.get_bucket_mut(&key).await;
+        let size_before = guard.len();
+        let entry = guard.entry(key);
+        let res = f(entry);
+        let size_after = guard.len();
+        let diff = (size_after as isize) - (size_before as isize);
+        if diff > 0 {
+            self.size.fetch_add(diff as usize, Ordering::Relaxed);
+        } else {
+            self.size.fetch_sub(diff.abs() as usize, Ordering::Relaxed);
+        }
+        res
+    }
+
     async fn get_bucket<Q>(&self, k: &Q) -> RwLockReadGuard<HashMap<K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut hasher = DefaultHasher::new();
-        k.hash(&mut hasher);
-        let hash_value = hasher.finish();
-        let index = (hash_value % self.shard_count as u64) as usize;
+        let index = Self::get_index_for_key(self.shard_count as u64, k);
         self.maps[index].read().await
     }
 
@@ -98,34 +153,190 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let index = Self::get_index_for_key(self.shard_count as u64, k);
+        self.maps[index].write().await
+    }
+
+    fn get_index_for_key<Q>(shard_count: u64, k: &Q) -> usize
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut hasher = DefaultHasher::new();
         k.hash(&mut hasher);
         let hash_value = hasher.finish();
-        let index = (hash_value % self.shard_count as u64) as usize;
-        self.maps[index].write().await
+        (hash_value % shard_count) as usize
     }
 }
 
-pub struct ShardMapStream<'a, 'b, K, V> {
-    shard_map: &'b ShardMap<K, V>,
-    current_index: usize,
-    current_iter: Option<hash_map::Iter<'a, K, V>>
+impl<K, V> ShardMap<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    pub async fn entry<'a>(&'a mut self, key: K) -> ShardMapEntry<'a, K, V> {
+        let guard = self.get_bucket_mut(&key).await;
+        ShardMapEntry::new(guard, self.size.clone(), key)
+    }
 }
 
-// impl<'a, 'b, K, V> Stream for ShardMapStream<'a, 'b, K, V> {
-//     type Item = (&'a K, &'a V);
+impl<K, V> ShardMap<K, V>
+where
+    K: Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    pub async fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&K, &V),
+    {
+        for map in self.maps.iter() {
+            let guard = map.read().await;
+            for (k, v) in guard.iter() {
+                f(k, v);
+            }
+        }
+    }
 
-//     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-//         let mut map = self.shard_map.get_map_from_index(self.current_index);
-//         pin!(map);
-//         match map.poll(cx) {
-//             Poll::Ready(guard) => {
-//                 if let Some(iter) = self.current_iter {
-//                     Poll::Ready()
-//                 }
-//             },
-//         }
-//     }
+    pub async fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        let mut new_size = 0;
+        for map in self.maps.iter() {
+            let mut guard = map.write().await;
+            guard.retain(&mut f);
+            new_size += guard.len();
+        }
+        self.size.store(new_size, Ordering::Relaxed);
+    }
 
+    pub async fn for_each_async<F, Fut, O>(&self, mut f: F)
+    where
+        F: FnMut(&K, &V) -> Fut,
+        Fut: Future<Output = O>,
+    {
+    }
+}
 
-// }
+pub enum ShardMapEntry<'a, K, V> {
+    Occupied(OccupiedShardMapEntry<'a, K, V>),
+    Vacant(VacantShardMapEntry<'a, K, V>),
+}
+
+impl<'a, K, V> ShardMapEntry<'a, K, V> where K: Eq + Hash + Clone {
+    pub fn new(guard: RwLockWriteGuard<'a, HashMap<K, V>>, shard_map_size: Arc<AtomicUsize>, key: K) -> Self {
+        if guard.contains_key(&key) {
+            Self::Occupied(OccupiedShardMapEntry::new(guard, shard_map_size, key))
+        } else {
+            Self::Vacant(VacantShardMapEntry::new(guard, shard_map_size, key))
+        }
+    }
+
+    pub fn get(&self) -> Option<&V> {
+        match self {
+            Self::Occupied(occ) => Some(occ.get()),
+            Self::Vacant(_) => None
+        }
+    }
+
+    pub fn remove(&mut self) -> Option<V> {
+        match self {
+            Self::Occupied(occ) => Some(occ.remove()),
+            Self::Vacant(_) => None
+        }
+    }
+
+    pub fn and_modify<F>(self, f: F) -> Self
+        where F: FnOnce(&mut V), {
+        match self {
+            Self::Occupied(mut entry) => {
+                f(entry.get_mut());
+                Self::Occupied(entry)
+            },
+            Self::Vacant(entry) => Self::Vacant(entry)
+        }
+    }
+
+    pub fn or_insert<F>(self, default: V) {
+        if let Self::Vacant(entry) = self {
+            entry.insert(default);
+        }
+    }
+}
+
+pub struct OccupiedShardMapEntry<'a, K, V> {
+    guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+    shard_map_size: Arc<AtomicUsize>,
+    key: K,
+}
+
+impl<'a, K, V> OccupiedShardMapEntry<'a, K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    fn new(
+        guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+        shard_map_size: Arc<AtomicUsize>,
+        key: K,
+    ) -> Self {
+        Self {
+            guard,
+            shard_map_size,
+            key,
+        }
+    }
+
+    pub fn get(&self) -> &V {
+        self.guard.get(&self.key).unwrap()
+    }
+
+    pub fn get_mut(&mut self) -> &mut V {
+        self.guard.get_mut(&self.key).unwrap()
+    }
+
+    pub fn insert(&mut self, value: V) -> V {
+        if self.guard.contains_key(&self.key) {
+            self.shard_map_size.fetch_add(1, Ordering::Relaxed);
+        }
+        self.guard.insert(self.key.clone(), value).unwrap()
+    }
+
+    pub fn remove(&mut self) -> V {
+        self.shard_map_size.fetch_sub(1, Ordering::Relaxed);
+        self.guard.remove(&self.key).unwrap()
+    }
+
+    pub fn with_entry<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(hash_map::Entry<K, V>) -> R,
+    {
+        let exists_before = self.guard.contains_key(&self.key);
+        let entry = self.guard.entry(self.key.clone());
+        let res = f(entry);
+        let exists_after = self.guard.contains_key(&self.key);
+        if exists_before && !exists_after {
+            self.shard_map_size.fetch_sub(1, Ordering::Relaxed);
+        } else if !exists_before && exists_after {
+            self.shard_map_size.fetch_add(1, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+pub struct VacantShardMapEntry<'a, K, V> {
+    guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+    shard_map_size: Arc<AtomicUsize>,
+    key: K,
+}
+
+impl<'a, K, V> VacantShardMapEntry<'a, K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    pub fn insert(mut self, value: V) {
+        self.guard.insert(self.key, value);
+    }
+
+    fn new(guard: RwLockWriteGuard<'a, HashMap<K, V>>, shard_map_size: Arc<AtomicUsize>, key: K) -> Self where K: Eq + Hash + Clone {
+        Self { guard, shard_map_size, key }
+    }
+}

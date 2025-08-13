@@ -1,12 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use indexmap::IndexMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DbValue {
     String(String),
     List(VecDeque<String>),
     Stream(Vec<StreamElement>),
+    Hash(HashMap<String, String>)
 }
 
 impl DbValue {

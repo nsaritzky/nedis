@@ -78,12 +78,15 @@ impl From<&DbValue> for RedisResponse {
                     })
                     .collect(),
             ),
+            DbValue::Hash(map) => RedisResponse::List(
+                map.iter().flat_map(|(k, v)| [k.clone().into(), v.clone().into()]).collect()
+            )
         }
     }
 }
 
-impl From<Vec<&StreamElement>> for RedisResponse {
-    fn from(value: Vec<&StreamElement>) -> Self {
+impl From<Vec<&mut StreamElement>> for RedisResponse {
+    fn from(value: Vec<&mut StreamElement>) -> Self {
         RedisResponse::List(
             value
                 .into_iter()

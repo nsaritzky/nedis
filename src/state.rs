@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeSet, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -14,17 +14,15 @@ use either::Either;
 use futures::future::join_all;
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
-use crate::{db_value::DbValue, replica_tracker::ReplicaTracker};
+use crate::{db_value::DbValue, replica_tracker::ReplicaTracker, shard_map::ShardMap};
 
-type Db = Arc<RwLock<HashMap<String, (DbValue, Option<SystemTime>)>>>;
+type Db = ShardMap<String, (DbValue, Option<SystemTime>)>;
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
 type TransactionQueue = Arc<Mutex<Vec<(Vec<String>, usize)>>>;
 type Subscriptions =
-    Arc<RwLock<HashMap<String, Vec<(broadcast::Sender<SubscriptionMessage>, usize)>>>>;
+    Arc<RwLock<HashMap<String, HashMap<usize, broadcast::Sender<SubscriptionMessage>>>>>;
 
-type Channel<T> = (broadcast::Sender<T>, broadcast::Receiver<T>);
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerState {
     pub state: Either<MasterState, ReplicaState>,
     pub db: Db,
@@ -49,7 +47,7 @@ impl ServerState {
     pub fn new(
         is_master: bool,
         replica_tx: Option<broadcast::Sender<Bytes>>,
-        db: Option<HashMap<String, (DbValue, Option<SystemTime>)>>,
+        db: Option<HashMap<String, (DbValue, Option<SystemTime>)>>
     ) -> Self {
         ServerState {
             state: if is_master {
@@ -59,7 +57,10 @@ impl ServerState {
             } else {
                 Either::Right(ReplicaState::new())
             },
-            db: Arc::new(RwLock::new(db.unwrap_or(HashMap::new()))),
+            db: match db {
+                Some(db) => ShardMap::from_hash_map(16, db),
+                None => ShardMap::new(16)
+            },
             blocks: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
@@ -123,17 +124,17 @@ impl ServerState {
     ) {
         let mut subs = self.subscriptions.write().await;
         subs.entry(key)
-            .and_modify(|arr| {
-                arr.push((tx.clone(), connection_id));
+            .and_modify(|senders| {
+                senders.insert(connection_id, tx.clone());
             })
-            .or_insert(vec![(tx.clone(), connection_id)]);
+            .or_insert(HashMap::from([(connection_id, tx.clone())]));
     }
 
     pub async fn remove_subscription(&mut self, key: String, connection_id: usize) {
         let mut subs = self.subscriptions.write().await;
         if let Entry::Occupied(mut occ) = subs.entry(key) {
             let senders = occ.get_mut();
-            senders.retain(|(_, conn_id)| connection_id != *conn_id);
+            senders.remove(&connection_id);
             if senders.is_empty() {
                 occ.remove();
             }
@@ -142,13 +143,13 @@ impl ServerState {
 
     pub async fn get_subscripiton_count(&self, key: &str) -> usize {
         let subs = self.subscriptions.read().await;
-        subs.get(key).map(|vec| vec.len()).unwrap_or(0)
+        subs.get(key).map(|senders| senders.len()).unwrap_or(0)
     }
 
     pub async fn publish_subscription_message(&self, key: &str, msg: String) -> anyhow::Result<()> {
         let subs = self.subscriptions.read().await;
         if let Some(senders) = subs.get(key) {
-            let futures = senders.iter().map(|(tx, _)| {
+            let futures = senders.iter().map(|(_, tx)| {
                 let msg = msg.clone();
                 async move { tx.send(SubscriptionMessage::Message(msg)) }
             });

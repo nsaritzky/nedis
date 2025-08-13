@@ -1,6 +1,7 @@
 mod args;
 mod db_value;
 mod global_config;
+mod hash;
 mod hex;
 mod parser;
 mod rdb_parser;
@@ -24,13 +25,16 @@ use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use db_value::{DbValue, StreamElement};
+use futures::future::join_all;
 use global_config::{GlobalConfig, MasterConfig, SlaveConfig};
+use hash::{handle_hget, handle_hset};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use num::ToPrimitive;
 use rdb_parser::parse_db;
 use redis_value::{PrimitiveRedisValue, RedisValue};
 use response::RedisResponse;
+use shard_map::ShardMapEntry;
 use state::{ConnectionState, ConnectionType, ServerState, SubscriptionMessage};
 use thiserror::Error;
 use tokio::{
@@ -107,12 +111,6 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-
-    if let Some(ref db) = db {
-        println!("Preexisting db with length {}", db.len());
-    } else {
-        println!("No existing db");
-    }
 
     let server_state = ServerState::new(
         is_master,
@@ -270,7 +268,22 @@ async fn process_input(
     connection_state: ConnectionState,
 ) -> anyhow::Result<()> {
     // let commands_nonempty = !results.is_empty();
-    for (mut v, message_len) in results {
+    for (v, message_len) in results {
+        let should_send_response =
+            if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster {
+                match (v.get(0), v.get(1)) {
+                    (Some(a), Some(b))
+                        if a.to_ascii_uppercase() == "REPLCONF"
+                            && b.to_ascii_uppercase() == "GETACK" =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
+
         if connection_state.get_transaction_active() {
             match v[0].to_ascii_uppercase().as_str() {
                 "EXEC" => {
@@ -308,28 +321,13 @@ async fn process_input(
                 vec![format!("-ERR Can't execute '{}'\r\n", v[0]).into()]
             } else {
                 execute_command(
-                    &mut v,
+                    v,
                     message_len,
                     server_state.clone(),
                     connection_state.clone(),
                 )
                 .await?
             };
-
-            let should_send_response =
-                if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster {
-                    match (v.get(0), v.get(1)) {
-                        (Some(a), Some(b))
-                            if a.to_ascii_uppercase() == "REPLCONF"
-                                && b.to_ascii_uppercase() == "GETACK" =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    }
-                } else {
-                    true
-                };
 
             if should_send_response {
                 for resp in responses {
@@ -349,7 +347,7 @@ async fn process_input(
 }
 
 async fn execute_command(
-    v: &mut Vec<String>,
+    mut v: Vec<String>,
     message_len: usize,
     server_state: ServerState,
     connection_state: ConnectionState,
@@ -359,31 +357,33 @@ async fn execute_command(
     match v[0].to_ascii_uppercase().as_str() {
         "PING" => handle_ping(connection_state),
         "ECHO" => Ok(vec![bulk_string(&v[1])]),
-        "SET" => handle_set(server_state, v).await,
-        "GET" => handle_get(server_state, v).await,
-        "RPUSH" => handle_rpush(server_state, v, &mut i).await,
-        "LRANGE" => handle_lrange(server_state, v, &mut i).await,
-        "LPUSH" => handle_lpush(server_state, v, &mut i).await,
-        "LLEN" => handle_llen(server_state, v, &mut i).await,
-        "LPOP" => handle_lpop(server_state, v, &mut i).await,
-        "BLPOP" => handle_blpop(server_state, v, &mut i).await,
-        "TYPE" => handle_type(server_state, v, &mut i).await,
-        "XADD" => handle_xadd(server_state, v, &mut i).await,
-        "XRANGE" => handle_xrange(server_state, v, &mut i).await,
-        "XREAD" => handle_xread(server_state, v, &mut i).await,
-        "INCR" => handle_incr(server_state, v, &mut i).await,
+        "SET" => handle_set(server_state, &mut v).await,
+        "GET" => handle_get(server_state, &mut v).await,
+        "RPUSH" => handle_rpush(server_state, &mut v, &mut i).await,
+        "LRANGE" => handle_lrange(server_state, &mut v, &mut i).await,
+        "LPUSH" => handle_lpush(server_state, &mut v, &mut i).await,
+        "LLEN" => handle_llen(server_state, &mut v, &mut i).await,
+        "LPOP" => handle_lpop(server_state, &mut v, &mut i).await,
+        "BLPOP" => handle_blpop(server_state, &mut v, &mut i).await,
+        "TYPE" => handle_type(server_state, &mut v, &mut i).await,
+        "XADD" => handle_xadd(server_state, &mut v, &mut i).await,
+        "XRANGE" => handle_xrange(server_state, &mut v, &mut i).await,
+        "XREAD" => handle_xread(server_state, &mut v, &mut i).await,
+        "INCR" => handle_incr(server_state, &mut v, &mut i).await,
         "MULTI" => handle_multi(connection_state).await,
-        "INFO" => handle_info(v),
+        "INFO" => handle_info(&mut v),
         "EXEC" => Ok(vec!["-ERR EXEC without MULTI\r\n".into()]),
         "DISCARD" => Ok(vec!["-ERR DISCARD without MULTI\r\n".into()]),
-        "REPLCONF" => handle_replconf(v, message_len, server_state, connection_state).await,
-        "WAIT" => handle_wait(v, server_state).await,
+        "REPLCONF" => handle_replconf(&mut v, message_len, server_state, connection_state).await,
+        "WAIT" => handle_wait(&mut v, server_state).await,
         "PSYNC" => handle_psync(server_state, connection_state).await,
-        "CONFIG" => handle_config(v),
+        "CONFIG" => handle_config(&mut v),
         "KEYS" => handle_keys(server_state).await,
-        "SUBSCRIBE" => handle_subscribe(server_state, connection_state, v).await,
-        "PUBLISH" => handle_publish(server_state, v).await,
-        "UNSUBSCRIBE" => handle_unsubscribe(connection_state, v).await,
+        "SUBSCRIBE" => handle_subscribe(server_state, connection_state, &mut v).await,
+        "PUBLISH" => handle_publish(server_state, &mut v).await,
+        "UNSUBSCRIBE" => handle_unsubscribe(connection_state, &mut v).await,
+        "HGET" => handle_hget(server_state, &v).await,
+        "HSET" => handle_hset(server_state, v).await,
         s if s.starts_with("FULLRESYNC") => Ok(vec![]),
         _ => {
             bail!("Invalid command")
@@ -442,7 +442,7 @@ async fn handle_set(server_state: ServerState, v: &mut Vec<String>) -> anyhow::R
     };
 
     if let (Some(key), Some(value)) = (key, value) {
-        let mut db = server_state.db.write().await;
+        let mut db = server_state.db;
 
         match v.get(1) {
             Some(s) if s.to_ascii_uppercase() == "PX" => {
@@ -453,10 +453,11 @@ async fn handle_set(server_state: ServerState, v: &mut Vec<String>) -> anyhow::R
                     .checked_add(Duration::from_millis(expires_in))
                     .ok_or(anyhow!("SET: Invalid expires durartion"))?;
 
-                db.insert(key, (DbValue::String(value), Some(expires)));
+                db.insert(key, (DbValue::String(value), Some(expires)))
+                    .await;
             }
             _ => {
-                db.insert(key, (DbValue::String(value), None));
+                db.insert(key, (DbValue::String(value), None)).await;
             }
         }
         Ok(vec!["+OK\r\n".into()])
@@ -465,15 +466,14 @@ async fn handle_set(server_state: ServerState, v: &mut Vec<String>) -> anyhow::R
     }
 }
 
-async fn handle_get(server_state: ServerState, v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
+async fn handle_get(mut server_state: ServerState, v: &mut Vec<String>) -> anyhow::Result<Vec<Bytes>> {
     let key = &v[1];
 
-    let mut db = server_state.db.write().await;
-
-    if let Some((value, expiry)) = db.get(key) {
+    let mut entry = server_state.db.entry(key.to_string()).await;
+    if let Some((value, expiry)) = entry.get() {
         if let Some(expiry) = expiry {
             if *expiry < SystemTime::now() {
-                db.remove(key);
+                entry.remove();
                 Ok(vec!["$-1\r\n".into()])
             } else {
                 Ok(vec![RedisResponse::from(value).to_bytes()])
@@ -497,21 +497,25 @@ async fn handle_rpush(
     };
 
     if let Some(key) = key {
-        let mut db = server_state.db.write().await;
+        let mut db = server_state.db;
 
-        if let Some((DbValue::List(ref mut array), _)) = db.get_mut(&key) {
-            array.append(&mut values.into());
+        let size_res = db.with_entry(key, |entry| match entry {
+            Entry::Occupied(mut occ) => {
+                if let (DbValue::List(ref mut array), _) = occ.get_mut() {
+                    array.append(&mut values.into());
+                    Ok(array.len())
+                } else {
+                    bail!("RPUSH: Value at key is not a list")
+                }
+            }
+            Entry::Vacant(vac) => {
+                let size = values.len();
+                vac.insert((DbValue::List(values.into()), None));
+                Ok(size)
+            }
+        }).await;
 
-            let resp = RedisResponse::Int(array.len().to_isize().unwrap());
-            Ok(vec![resp.to_bytes()])
-        } else {
-            let size = values.len().to_isize().unwrap();
-
-            db.insert(key, (DbValue::List(values.into()), None));
-
-            let resp = RedisResponse::Int(size);
-            Ok(vec![resp.to_bytes()])
-        }
+        size_res.map(|n| vec![RedisResponse::Int(n as isize).to_bytes()])
     } else {
         bail!("Bad key: {key:?}");
     }
@@ -526,70 +530,96 @@ async fn handle_lrange(
     let empty_array_response = RedisResponse::List(vec![]).to_bytes();
     let key = &v[*i];
 
-    let db = server_state.db.read().await;
+    let db = server_state.db;
 
-    if let Some((DbValue::List(array), _)) = db.get(key) {
-        if let (Some(a), Some(b)) = (v.get(*i + 1), v.get(*i + 2)) {
-            let a: isize = a.parse()?;
-            let a: usize = if a >= 0 {
-                a.to_usize().unwrap()
-            } else {
-                array.len().checked_add_signed(a).unwrap_or(0)
-            };
-            let b: isize = b.parse()?;
-            let b: usize = if b >= 0 {
-                b.to_usize().unwrap()
-            } else {
-                array.len().checked_add_signed(b).unwrap_or(0)
-            };
+    let result = db
+        .with_value(key, |(val, _)| {
+            if let DbValue::List(array) = val {
+                if let (Some(a), Some(b)) = (v.get(2), v.get(3)) {
+                    let a: isize = a.parse()?;
+                    let a: usize = if a >= 0 {
+                        a.to_usize().unwrap()
+                    } else {
+                        array.len().checked_add_signed(a).unwrap_or(0)
+                    };
+                    let b: isize = b.parse()?;
+                    let b: usize = if b >= 0 {
+                        b.to_usize().unwrap()
+                    } else {
+                        array.len().checked_add_signed(b).unwrap_or(0)
+                    };
 
-            if a >= array.len() {
+
+                    if a >= array.len() {
+                        Ok(vec![empty_array_response])
+                    } else if b > array.len() - 1 {
+                        let resp = RedisResponse::List(
+                            array
+                                .range(a..)
+                                .map(|s| RedisResponse::Str(s.clone()))
+                                .collect(),
+                        );
+                        Ok(vec![resp.to_bytes()])
+                    } else {
+                        let resp = RedisResponse::List(
+                            array
+                                .range(a..=b)
+                                .map(|s| RedisResponse::Str(s.clone()))
+                                .collect(),
+                        );
+                        Ok(vec![resp.to_bytes()])
+                    }
+                } else {
+                    bail!("Failed to get array bounds");
+                }
+            } else {
                 Ok(vec![empty_array_response])
-            } else if b > array.len() - 1 {
-                let resp = RedisResponse::List(
-                    array
-                        .range(a..)
-                        .map(|s| RedisResponse::Str(s.clone()))
-                        .collect(),
-                );
-                Ok(vec![resp.to_bytes()])
-            } else {
-                let resp = RedisResponse::List(
-                    array
-                        .range(a..=b)
-                        .map(|s| RedisResponse::Str(s.clone()))
-                        .collect(),
-                );
-                Ok(vec![resp.to_bytes()])
             }
-        } else {
-            bail!("Failed to get array bounds");
-        }
+        })
+        .await;
+
+    if let Some(Ok(resp)) = result {
+        Ok(resp)
     } else {
-        Ok(vec![empty_array_response])
+        Ok(vec!["*0\r\n".into()])
     }
 }
 
 async fn handle_lpush(
-    server_state: ServerState,
+    mut server_state: ServerState,
     v: &mut Vec<String>,
     i: &mut usize,
 ) -> anyhow::Result<Vec<Bytes>> {
-    let (key, mut values) = {
+    let (key, values) = {
         let mut drain = v.drain(*i + 1..);
-        (drain.next(), drain.rev().collect::<VecDeque<_>>())
+        (drain.next(), drain.collect::<VecDeque<_>>())
     };
 
     if let Some(key) = key {
-        let mut db = server_state.db.write().await;
+        let entry = server_state.db.entry(key).await;
 
-        if let Some((DbValue::List(ref mut array), _)) = db.get_mut(&key) {
-            values.append(array);
-        }
-        let size = values.len().to_isize().unwrap();
-        db.insert(key, (DbValue::List(values), None));
+        let size = match entry {
+            ShardMapEntry::Occupied(mut occ) => {
+                if let (DbValue::List(ref mut array), _) = occ.get_mut() {
+                    for s in values {
+                        array.push_front(s.into())
+                    }
+                    array.len()
+                } else {
+                    bail!("LPUSH: Value is not a list")
+                }
+            }
+            ShardMapEntry::Vacant(vac) => {
+                let size = values.len();
+                vac.insert((
+                    DbValue::List(values.into_iter().rev().map(|s| s.into()).collect()),
+                    None,
+                ));
+                size
+            }
+        };
 
-        let resp = RedisResponse::Int(size);
+        let resp = RedisResponse::Int(size as isize);
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("Bad key: {key:?}");
@@ -604,9 +634,8 @@ async fn handle_llen(
     *i += 1;
 
     let key = &v[*i];
-    let db = server_state.db.read().await;
-
-    if let Some((DbValue::List(array), _)) = db.get(key) {
+    let value = server_state.db.get(key).await;
+    if let Some((DbValue::List(array), _)) = value.as_deref() {
         let size = array.len().to_isize().unwrap();
         let resp = RedisResponse::Int(size);
 
@@ -627,9 +656,11 @@ async fn handle_lpop(
     *i += 1;
 
     let key = &v[*i];
-    let mut db = server_state.db.write().await;
+    let mut db = server_state.db;
 
-    if let Some((DbValue::List(ref mut array), _)) = db.get_mut(key) {
+    let mut value = db.get_mut(key).await;
+
+    if let Some((DbValue::List(ref mut array), _)) = value.as_deref_mut() {
         if let Some(n) = v.get(*i + 1) {
             *i += 1;
 
@@ -703,8 +734,9 @@ async fn handle_blpop(
             }
         }
 
-        let mut db = server_state.db.write().await;
-        if let Some((DbValue::List(ref mut array), _)) = db.get_mut(key) {
+        let mut db = server_state.clone().db;
+        let mut value = db.get_mut(key).await;
+        if let Some((DbValue::List(ref mut array), _)) = value.as_deref_mut() {
             if !array.is_empty() {
                 let mut blocks = server_state.blocks.lock().await;
                 if let Some(blocks_set) = blocks.get_mut(key) {
@@ -739,13 +771,15 @@ async fn handle_type(
     *i += 1;
 
     if let Some(key) = v.get(*i) {
-        let db = server_state.db.read().await;
+        let db = server_state.db;
 
-        match db.get(key) {
+        let value = db.get(key).await;
+        match value.as_deref() {
             Some((DbValue::String(_), _)) | Some((DbValue::List(_), _)) => {
                 Ok(vec!["+string\r\n".into()])
             }
             Some((DbValue::Stream(_), _)) => Ok(vec!["+stream\r\n".into()]),
+            Some((DbValue::Hash(_), _)) => Ok(vec!["+hash\r\n".into()]),
             None => Ok(vec!["+none\r\n".into()]),
         }
     } else {
@@ -761,14 +795,12 @@ async fn handle_xadd(
     *i += 1;
 
     if let Some(key) = v.get(*i) {
-        let mut db = server_state.db.write().await;
+        let mut db = server_state.db;
 
-        let stream_vec = if let Some((DbValue::Stream(stream_vec), _)) = db.get_mut(key) {
-            stream_vec
-        } else {
-            db.insert(key.clone(), (DbValue::Stream(Vec::new()), None));
-            db.get_mut(key).unwrap().0.to_stream_vec_mut().unwrap()
-        };
+        db.with_entry(key.clone(), |entry| {
+
+            let (value, _) = entry.or_insert((DbValue::Stream(vec![]), None));
+            let stream_vec = value.to_stream_vec_mut().unwrap();
 
         if let Some(id) = v.get(*i + 1) {
             *i += 1;
@@ -804,6 +836,7 @@ async fn handle_xadd(
         } else {
             bail!("Could not get id");
         }
+        }).await
     } else {
         bail!("Could not extract key");
     }
@@ -817,9 +850,10 @@ async fn handle_xrange(
     *i += 1;
 
     if let Some(key) = v.get(*i) {
-        let db = server_state.db.read().await;
+        let mut db = server_state.db;
 
-        if let Some((DbValue::Stream(stream_vec), _)) = db.get(key) {
+        let mut value = db.get_mut(key).await;
+        if let Some((DbValue::Stream(stream_vec), _)) = value.as_deref_mut() {
             let mut drain = v.drain(*i + 1..*i + 3);
             let start = drain.next().unwrap();
             let end = drain.next().unwrap();
@@ -918,11 +952,10 @@ async fn handle_xread(
             let start = &v[*i + 2];
 
             let (start_timestamp, start_sequence) = {
-                let db = server_state.db.read().await;
-                parse_id_with_dollar_sign(
-                    &start,
-                    db.get(key).and_then(|(val, _)| val.to_stream_vec()),
-                )
+                let db = server_state.clone().db;
+                let value = db.get(key).await;
+                let stream_vec = value.as_deref().and_then(|(val, _)| val.to_stream_vec());
+                parse_id_with_dollar_sign(&start, stream_vec)
             };
 
             loop {
@@ -932,35 +965,34 @@ async fn handle_xread(
                     return Ok(vec!["$-1\r\n".into()]);
                 }
 
-                if let Ok(db) = server_state.db.try_read() {
-                    if let Some((DbValue::Stream(stream_vec), _)) = db.get(key) {
-                        if let Some(last) = stream_vec.last() {
-                            let (timestamp, sequence) = parse_id(&last.id);
-                            if timestamp > start_timestamp
-                                || (timestamp == start_timestamp && sequence > start_sequence)
+                let value = server_state.db.get(key).await;
+                if let Some((DbValue::Stream(stream_vec), _)) = value.as_deref() {
+                    if let Some(last) = stream_vec.last() {
+                        let (timestamp, sequence) = parse_id(&last.id);
+                        if timestamp > start_timestamp
+                            || (timestamp == start_timestamp && sequence > start_sequence)
+                        {
+                            let mut j = 0usize;
+
+                            let (mut timestamp, mut sequence) = parse_id(&stream_vec[0].id);
+                            while timestamp < start_timestamp
+                                || (timestamp == start_timestamp && sequence <= start_sequence)
                             {
-                                let mut j = 0usize;
+                                j += 1;
 
-                                let (mut timestamp, mut sequence) = parse_id(&stream_vec[0].id);
-                                while timestamp < start_timestamp
-                                    || (timestamp == start_timestamp && sequence <= start_sequence)
-                                {
-                                    j += 1;
-
-                                    (timestamp, sequence) = parse_id(&stream_vec[j].id);
-                                }
-
-                                let result_vec = gather_stream_read_results(
-                                    stream_vec[j..].iter().collect(),
-                                    start_timestamp,
-                                    start_sequence,
-                                    key.clone(),
-                                );
-
-                                let resp_value = RedisResponse::List(vec![result_vec].into());
-
-                                return Ok(vec![resp_value.to_bytes()]);
+                                (timestamp, sequence) = parse_id(&stream_vec[j].id);
                             }
+
+                            let result_vec = gather_stream_read_results(
+                                stream_vec[j..].iter().collect(),
+                                start_timestamp,
+                                start_sequence,
+                                key.clone(),
+                            );
+
+                            let resp_value = RedisResponse::List(vec![result_vec].into());
+
+                            return Ok(vec![resp_value.to_bytes()]);
                         }
                     }
                 }
@@ -970,11 +1002,11 @@ async fn handle_xread(
 
     *i += 1;
 
-    let db = server_state.db.read().await;
+    let db = server_state.db;
 
     let mut keys = Vec::new();
 
-    while db.contains_key(&v[*i]) {
+    while db.contains_key(&v[*i]).await {
         keys.push(&v[*i]);
         *i += 1;
     }
@@ -989,13 +1021,14 @@ async fn handle_xread(
         );
     }
 
-    let result_vec: Vec<_> = keys
+    let futures_vec: Vec<_> = keys
         .into_iter()
         .zip(starts)
-        .map(|(k, start)| {
+        .map(|(k, start)| async {
             let (start_timestamp, start_sequence) = parse_id(start);
             gather_stream_read_results(
                 db.get(k)
+                    .await
                     .unwrap()
                     .0
                     .to_stream_vec()
@@ -1009,6 +1042,7 @@ async fn handle_xread(
         })
         .collect();
 
+    let result_vec = join_all(futures_vec).await;
     Ok(vec![RedisResponse::List(result_vec).to_bytes()])
 }
 
@@ -1021,26 +1055,28 @@ async fn handle_incr(
 
     let key = &v[*i];
 
-    let mut db = server_state.db.write().await;
+    let mut db = server_state.db;
 
-    let updated_int = match db.entry(key.clone()) {
-        Entry::Occupied(mut occ) => {
-            if let (DbValue::String(old_val), expired) = occ.get() {
-                if let Ok(n) = old_val.parse::<isize>() {
-                    occ.insert((DbValue::String((n + 1).to_string()), *expired));
-                    Some(n + 1)
+    let updated_int = db
+        .with_entry(key.clone(), |entry| match entry {
+            Entry::Occupied(mut occ) => {
+                if let (DbValue::String(old_val), expired) = occ.get() {
+                    if let Ok(n) = old_val.parse::<isize>() {
+                        occ.insert((DbValue::String((n + 1).to_string()), *expired));
+                        Some(n + 1)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
             }
-        }
-        Entry::Vacant(vac) => {
-            vac.insert((DbValue::String("1".to_string()), None));
-            Some(1isize)
-        }
-    };
+            Entry::Vacant(vac) => {
+                vac.insert((DbValue::String("1".to_string()), None));
+                Some(1isize)
+            }
+        })
+        .await;
 
     if let Some(n) = updated_int {
         let resp_val: RedisValue = n.into();
@@ -1063,14 +1099,18 @@ async fn handle_exec(
 ) -> anyhow::Result<Vec<Bytes>> {
     let mut buf = BytesMut::new();
     let cs = connection_state.clone();
-    let mut transaction_queue = cs.transaction_queue.lock().await;
 
-    buf.put_slice(format!("*{}\r\n", transaction_queue.len()).as_bytes());
+    let transactions: Vec<_> = {
+        let mut tq = cs.transaction_queue.lock().await;
+        tq.drain(..).collect()
+    };
 
-    for (args, message_len) in transaction_queue.iter_mut() {
+    buf.put_slice(format!("*{}\r\n", transactions.len()).as_bytes());
+
+    for (args, message_len) in transactions {
         let responses = execute_command(
             args,
-            *message_len,
+            message_len,
             server_state.clone(),
             connection_state.clone(),
         )
@@ -1246,7 +1286,7 @@ fn handle_config(v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
 }
 
 async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
-    let mut db = server_state.db.write().await;
+    let mut db = server_state.db;
     let mut buf = BytesMut::new();
     let mut values_buf = BytesMut::new();
     let now = SystemTime::now();
@@ -1257,7 +1297,8 @@ async fn handle_keys(server_state: ServerState) -> anyhow::Result<Vec<Bytes>> {
         } else {
             false
         }
-    });
+    })
+    .await;
     buf.extend_from_slice(format!("*{}\r\n", db.len()).as_bytes());
     buf.extend_from_slice(&values_buf);
     Ok(vec![buf.freeze()])
@@ -1331,10 +1372,14 @@ async fn handle_unsubscribe(
             (Some(tx), count) => {
                 tx.send(SubscriptionMessage::Unsubscribe)?;
                 count
-            },
-            (None, count) => count
+            }
+            (None, count) => count,
         } as isize;
-        let resp = RedisResponse::List(vec!["unsubscribe".into(), key.to_string().into(), count.into()]);
+        let resp = RedisResponse::List(vec![
+            "unsubscribe".into(),
+            key.to_string().into(),
+            count.into(),
+        ]);
         Ok(vec![resp.to_bytes()])
     } else {
         bail!("UNSUBSCRIBE: no key provided")
@@ -1424,12 +1469,12 @@ fn generate_and_validate_stream_id(
                     0
                 }
             } else {
-                let sequence = sequence
-                    .parse()
-                    .map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?;
                 if timestamp < last_timestamp {
                     return Err(StreamIdValidationError::DecreasingTimestamp);
                 }
+                let sequence = sequence
+                    .parse()
+                    .map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?;
                 if timestamp == last_timestamp && sequence <= last_sequence {
                     return Err(StreamIdValidationError::NonincreasingSequence);
                 }
