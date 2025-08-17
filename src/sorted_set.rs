@@ -73,10 +73,10 @@ impl<'a, T: Debug + Eq + Hash + Clone> SortedSet<T> {
         }
     }
 
-    pub fn insert(&mut self, value: T, score: f64) {
+    pub fn insert(&mut self, value: T, score: f64) -> bool {
         let ord_float = OrdFloat::new(score);
         self.hash_map.insert(value.clone(), ord_float);
-        self.skip_list.insert(KeyTuple(ord_float, value));
+        self.skip_list.insert(KeyTuple(ord_float, value)).is_some()
     }
 
     pub fn contains(&self, value: &T) -> bool {
@@ -118,8 +118,11 @@ impl CommandHandler for ZADDHandler {
             ShardMapEntry::Occupied(mut occ) => {
                 match occ.get_mut() {
                     (DbValue::ZSet(zset), _) => {
-                        zset.insert(value, score);
-                        zset.len()
+                        if zset.insert(value, score) {
+                            1
+                        } else {
+                            0
+                        }
                     }
                     _ => bail!("ZADD: Value at key is not a zset"),
                 }
