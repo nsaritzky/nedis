@@ -1,11 +1,19 @@
 #![allow(dead_code)]
 use std::{
-    borrow::Borrow, collections::{hash_map::{self, OccupiedEntry}, HashMap}, future::Future, hash::{DefaultHasher, Hash, Hasher}, ops::{Deref, DerefMut, Sub}, sync::{
+    borrow::Borrow,
+    collections::{
+        hash_map::{self},
+        HashMap,
+    },
+    future::Future,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
-    }
+    },
 };
 
+use futures::future::join_all;
 use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug, Clone)]
@@ -62,6 +70,133 @@ where
     {
         let map = self.get_bucket(key).await;
         map.get(key).map(f)
+    }
+
+    pub async fn with_values<R, F, Q>(&self, keys: &[Q], f: F) -> R
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+        F: FnOnce(&[Option<&V>]) -> R,
+    {
+        let mut key_groups: HashMap<usize, Vec<(usize, &Q)>> = HashMap::new();
+
+        for (original_idx, key) in keys.iter().enumerate() {
+            let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+            key_groups
+                .entry(shard_idx)
+                .and_modify(|vec| vec.push((original_idx, key)))
+                .or_insert(vec![(original_idx, key)]);
+        }
+
+        let futures = key_groups
+            .keys()
+            .map(|shard_idx| async move { (shard_idx, self.maps[*shard_idx].read().await) });
+
+        let guards = join_all(futures).await;
+
+        let guard_map: HashMap<_, _> = guards.iter().map(|(idx, guard)| (*idx, guard)).collect();
+
+        let results: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+                guard_map.get(&shard_idx).and_then(|guard| guard.get(key))
+            })
+            .collect();
+
+        f(&results)
+    }
+
+    async fn with_values_mut_raw<R, F, Q>(&self, keys: &[Q], f: F) -> R
+        where
+        K: Borrow<Q>,
+    Q: Eq + Hash,
+    F: FnOnce(&mut [Option<*mut V>]) -> R, {
+        let mut key_groups: HashMap<usize, Vec<(usize, &Q)>> = HashMap::new();
+
+        for (original_idx, key) in keys.iter().enumerate() {
+            let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+            key_groups
+                .entry(shard_idx)
+                .and_modify(|vec| vec.push((original_idx, key)))
+                .or_insert(vec![(original_idx, key)]);
+        }
+
+        let futures = key_groups
+            .keys()
+            .map(|&shard_idx| async move {
+                (shard_idx, self.maps[shard_idx].write().await)
+            });
+
+        let mut guards = join_all(futures).await;
+
+        let mut results = vec![None; keys.len()];
+
+        for (shard_idx, guard) in guards.iter_mut() {
+            if let Some(keys_for_shard) = key_groups.get(shard_idx) {
+                for &(original_idx, key) in keys_for_shard {
+                    if let Some(value) = guard.get_mut(key) {
+                        results[original_idx] = Some(value as *mut V);
+                    }
+                }
+            }
+        }
+        f(&mut results)
+    }
+
+    pub async fn with_values_mut<R, F, Q>(&self, keys: &[Q], f: F) -> R
+        where
+        K: Borrow<Q>,
+    Q: Eq + Hash,
+    F: FnOnce(&mut [Option<&mut V>]) -> R, {
+        self.with_values_mut_raw(keys, |ptrs| {
+            let mut refs: Vec<Option<&mut V>> = ptrs.iter_mut()
+                .map(|ptr_opt| {
+                    ptr_opt.map(|ptr| unsafe { &mut *ptr })
+                })
+                .collect();
+
+            f(&mut refs)
+        }).await
+    }
+
+    pub async fn with_values_owned<R, F, Q>(&self, keys: &[Q], f: F) -> R
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+        V: Clone,
+        F: FnOnce(&[Option<V>]) -> R,
+    {
+        let mut key_groups: HashMap<usize, Vec<(usize, &Q)>> = HashMap::new();
+
+        for (original_idx, key) in keys.iter().enumerate() {
+            let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+            key_groups
+                .entry(shard_idx)
+                .and_modify(|vec| vec.push((original_idx, key)))
+                .or_insert(vec![(original_idx, key)]);
+        }
+
+        let futures = key_groups
+            .keys()
+            .map(|&shard_idx| async move { (shard_idx, self.maps[shard_idx].read().await) });
+
+        let guards = join_all(futures).await;
+
+        let mut results = vec![None; keys.len()];
+
+        let guard_map: HashMap<_, _> = guards.iter().map(|(idx, guard)| (*idx, guard)).collect();
+
+        for (original_idx, key) in keys.iter().enumerate() {
+            let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+            if let Some(guard) = guard_map.get(&shard_idx) {
+                results[original_idx] = guard.get(key).cloned();
+            }
+        }
+
+        drop(guards);
+
+        f(&results)
     }
 
     pub async fn get<Q>(&self, key: &Q) -> Option<RwLockReadGuard<V>>
@@ -209,7 +344,7 @@ where
         self.size.store(new_size, Ordering::Relaxed);
     }
 
-    pub async fn for_each_async<F, Fut, O>(&self, mut f: F)
+    pub async fn for_each_async<F, Fut, O>(&self, f: F)
     where
         F: FnMut(&K, &V) -> Fut,
         Fut: Future<Output = O>,
@@ -222,8 +357,15 @@ pub enum ShardMapEntry<'a, K, V> {
     Vacant(VacantShardMapEntry<'a, K, V>),
 }
 
-impl<'a, K, V> ShardMapEntry<'a, K, V> where K: Eq + Hash + Clone {
-    pub fn new(guard: RwLockWriteGuard<'a, HashMap<K, V>>, shard_map_size: Arc<AtomicUsize>, key: K) -> Self {
+impl<'a, K, V> ShardMapEntry<'a, K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    pub fn new(
+        guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+        shard_map_size: Arc<AtomicUsize>,
+        key: K,
+    ) -> Self {
         if guard.contains_key(&key) {
             Self::Occupied(OccupiedShardMapEntry::new(guard, shard_map_size, key))
         } else {
@@ -234,25 +376,27 @@ impl<'a, K, V> ShardMapEntry<'a, K, V> where K: Eq + Hash + Clone {
     pub fn get(&self) -> Option<&V> {
         match self {
             Self::Occupied(occ) => Some(occ.get()),
-            Self::Vacant(_) => None
+            Self::Vacant(_) => None,
         }
     }
 
     pub fn remove(&mut self) -> Option<V> {
         match self {
             Self::Occupied(occ) => Some(occ.remove()),
-            Self::Vacant(_) => None
+            Self::Vacant(_) => None,
         }
     }
 
     pub fn and_modify<F>(self, f: F) -> Self
-        where F: FnOnce(&mut V), {
+    where
+        F: FnOnce(&mut V),
+    {
         match self {
             Self::Occupied(mut entry) => {
                 f(entry.get_mut());
                 Self::Occupied(entry)
-            },
-            Self::Vacant(entry) => Self::Vacant(entry)
+            }
+            Self::Vacant(entry) => Self::Vacant(entry),
         }
     }
 
@@ -336,7 +480,18 @@ where
         self.guard.insert(self.key, value);
     }
 
-    fn new(guard: RwLockWriteGuard<'a, HashMap<K, V>>, shard_map_size: Arc<AtomicUsize>, key: K) -> Self where K: Eq + Hash + Clone {
-        Self { guard, shard_map_size, key }
+    fn new(
+        guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+        shard_map_size: Arc<AtomicUsize>,
+        key: K,
+    ) -> Self
+    where
+        K: Eq + Hash + Clone,
+    {
+        Self {
+            guard,
+            shard_map_size,
+            key,
+        }
     }
 }

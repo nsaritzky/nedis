@@ -5,7 +5,7 @@ use std::{
 
 use winnow::{
     binary::{le_u16, le_u32, le_u64, le_u8},
-    combinator::{fail, opt, preceded, repeat, separated_pair, seq, trace},
+    combinator::{fail, opt, preceded, repeat, separated_pair, trace},
     dispatch,
     token::{any, one_of, take},
     Parser, Result,

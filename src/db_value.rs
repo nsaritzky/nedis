@@ -1,13 +1,17 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use indexmap::IndexMap;
+
+use crate::{skip_list::SkipList, sorted_set::SortedSet};
 
 #[derive(Debug, Clone)]
 pub enum DbValue {
     String(String),
     List(VecDeque<String>),
     Stream(Vec<StreamElement>),
-    Hash(HashMap<String, String>)
+    Hash(HashMap<String, String>),
+    Set(HashSet<String>),
+    ZSet(SortedSet<String>)
 }
 
 impl DbValue {

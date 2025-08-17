@@ -56,6 +56,16 @@ impl FromIterator<RedisResponse> for RedisResponse {
     }
 }
 
+impl<'a> FromIterator<&'a String> for RedisResponse {
+    fn from_iter<T: IntoIterator<Item = &'a String>>(iter: T) -> Self {
+        RedisResponse::List(
+            iter.into_iter()
+                .map(|s| RedisResponse::Str(s.to_string()))
+                .collect(),
+        )
+    }
+}
+
 impl From<&DbValue> for RedisResponse {
     fn from(value: &DbValue) -> Self {
         match value {
@@ -79,8 +89,12 @@ impl From<&DbValue> for RedisResponse {
                     .collect(),
             ),
             DbValue::Hash(map) => RedisResponse::List(
-                map.iter().flat_map(|(k, v)| [k.clone().into(), v.clone().into()]).collect()
-            )
+                map.iter()
+                    .flat_map(|(k, v)| [k.clone().into(), v.clone().into()])
+                    .collect(),
+            ),
+            DbValue::Set(set) => set.iter().collect(),
+            DbValue::ZSet(set) => unimplemented!(),
         }
     }
 }
