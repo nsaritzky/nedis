@@ -73,10 +73,16 @@ impl<'a, T: Debug + Eq + Hash + Clone> SortedSet<T> {
         }
     }
 
-    pub fn insert(&mut self, value: T, score: f64) -> bool {
+    pub fn insert_or_update(&mut self, value: T, score: f64) -> bool {
         let ord_float = OrdFloat::new(score);
-        self.hash_map.insert(value.clone(), ord_float);
-        self.skip_list.insert(KeyTuple(ord_float, value)).is_some()
+        if let Some(old_score) = self.hash_map.insert(value.clone(), ord_float) {
+            self.skip_list.delete(&KeyTuple(old_score, value.clone()));
+            self.skip_list.insert(KeyTuple(ord_float, value.clone()));
+            true
+        } else {
+            self.skip_list.insert(KeyTuple(ord_float, value));
+            false
+        }
     }
 
     pub fn contains(&self, value: &T) -> bool {
@@ -118,10 +124,10 @@ impl CommandHandler for ZADDHandler {
             ShardMapEntry::Occupied(mut occ) => {
                 match occ.get_mut() {
                     (DbValue::ZSet(zset), _) => {
-                        if zset.insert(value, score) {
-                            1
-                        } else {
+                        if zset.insert_or_update(value, score) {
                             0
+                        } else {
+                            1
                         }
                     }
                     _ => bail!("ZADD: Value at key is not a zset"),
@@ -129,7 +135,7 @@ impl CommandHandler for ZADDHandler {
             }
             ShardMapEntry::Vacant(vac) => {
                 let mut zset = SortedSet::new();
-                zset.insert(value, score);
+                zset.insert_or_update(value, score);
                 vac.insert((DbValue::ZSet(zset), None));
                 1
             }
