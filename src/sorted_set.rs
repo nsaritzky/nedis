@@ -227,12 +227,12 @@ impl CommandHandler for ZRangeHandler {
         let result = match value.as_deref() {
             Some((DbValue::ZSet(zset), _)) => {
                 let min = if min < 0 {
-                    zset.len() as isize + min
+                    0.max(zset.len() as isize + min)
                 } else {
                     min
                 } as usize;
                 let max = if max < 0 {
-                    zset.len() as isize + max
+                    0.max(zset.len() as isize + max)
                 } else {
                     max
                 } as usize;
@@ -244,5 +244,31 @@ impl CommandHandler for ZRangeHandler {
 
         let resp: RedisResponse = result.into_iter().collect();
         Ok(vec![resp.to_bytes()])
+    }
+}
+
+pub struct ZCardHandler;
+#[async_trait]
+impl CommandHandler for ZCardHandler {
+    async fn execute(
+        &self,
+        args: Vec<String>,
+        server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+    ) -> anyhow::Result<Vec<Bytes>> {
+        if args.len() != 2 {
+            bail!("ZCARD: Wrong number of arguments")
+        }
+        let [_command, redis_key] = args.try_into().unwrap();
+
+        let value = server_state.db.get(&redis_key).await;
+        let result = match value.as_deref() {
+            Some((DbValue::ZSet(zset), _)) => zset.len(),
+            Some(_) => bail!("ZCARD: Value at key is not a zset"),
+            None => 0
+        };
+
+        Ok(vec![RedisResponse::Int(result as isize).to_bytes()])
     }
 }
