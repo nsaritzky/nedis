@@ -225,8 +225,11 @@ impl<T: Ord + Debug> SkipList<T> {
                     let (update_i, offset_i) = update[i];
                     let (forward_i, span_i) = &mut (&mut (*update_i.as_ptr())).forward[i];
                     if *forward_i == node_to_delete {
-                        *forward_i = boxed_node.forward[i].0;
-                        *span_i = (rank - offset_i) + boxed_node.forward[i].1 - 1;
+                        let (moved_ptr, moved_span) = boxed_node.forward[i];
+                        *forward_i = moved_ptr;
+                        *span_i = (rank - offset_i) + moved_span;
+                    } else {
+                        *span_i -= 1;
                     }
                 }
                 self.len -= 1;
@@ -252,6 +255,7 @@ impl<T: Ord + Debug> SkipList<T> {
         let mut rank = 0;
         for i in (0..self.max_level).rev() {
             while let Some((next, span)) = self.forward(node).get(i) {
+                println!("Span {span} at value {:?} at level {i}", self.value(node));
                 if rank + span <= index + 1 {
                     node = *next;
                     rank += span;
@@ -260,6 +264,7 @@ impl<T: Ord + Debug> SkipList<T> {
                 }
             }
         }
+        println!("Iter head value {:?} at rank {rank}", self.value(node));
         unsafe {
             Iter {
                 next: node.as_ptr().as_ref(),

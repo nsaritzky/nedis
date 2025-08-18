@@ -1,6 +1,7 @@
 use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::select_all::Iter;
 
 use crate::{
     command_handler::CommandHandler,
@@ -43,33 +44,22 @@ impl Ord for OrdFloat {
     }
 }
 
-#[derive(Debug, Clone)]
-struct KeyTuple<K, V>(pub K, pub V);
-
-impl<K: Ord, V> PartialEq for KeyTuple<K, V> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<K: Ord, V> Eq for KeyTuple<K, V> {}
-
-impl<K: Ord, V> PartialOrd for KeyTuple<K, V> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<K: Ord, V> Ord for KeyTuple<K, V> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SortedSet<T: Ord + Debug + Eq + Hash> {
     skip_list: SkipList<(OrdFloat, T)>,
     hash_map: HashMap<T, OrdFloat>,
+}
+
+pub struct ZsetIter<'a, T: Ord + Debug + Eq + Hash> {
+    iter: crate::skip_list::Iter<'a, (OrdFloat, T)>
+}
+
+impl<'a, T: Ord + Debug + Eq + Hash> Iterator for ZsetIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|(_, item)| item)
+    }
 }
 
 impl<'a, T: Ord + Debug + Eq + Hash + Clone + Default> SortedSet<T> {
@@ -133,6 +123,12 @@ impl<'a, T: Ord + Debug + Eq + Hash + Clone + Default> SortedSet<T> {
             self.skip_list.delete(&(ord_float, value.clone()))
         } else {
             None
+        }
+    }
+
+    pub fn iter(&self) -> ZsetIter<'_, T> {
+        ZsetIter {
+            iter: self.skip_list.iter()
         }
     }
 
@@ -238,7 +234,6 @@ impl CommandHandler for ZRangeHandler {
                 } else {
                     max
                 } as usize;
-                println!("ZRange with real indices {min} and {max}");
                 zset.get_index_range(min, max)
             }
             Some(_) => bail!("ZRANGE: Value at key is not a zset"),
@@ -347,8 +342,14 @@ mod test {
         let mut zset = SortedSet::new();
 
         zset.insert_or_update("hello", 2.0);
-        // zset.insert_or_update("hello again", 1.0);
+        zset.insert_or_update("hello again", 1.0);
 
-        println!("zrange 0 0: {:?}", zset.get_index_range(0, 0));
+        zset.remove(&"hello");
+
+        assert_eq!(zset.len(), 1);
+        for item in zset.iter() {
+            println!("Item: {item:?}");
+        }
+        assert_eq!(zset.get_index_range(0, 0).len(), 1);
     }
 }
