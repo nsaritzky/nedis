@@ -192,7 +192,7 @@ impl<T: Ord + Debug> SkipList<T> {
         }
     }
 
-    pub fn delete<Q>(&mut self, to_delete: &Q)
+    pub fn delete<Q>(&mut self, to_delete: &Q) -> Option<T>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -230,6 +230,9 @@ impl<T: Ord + Debug> SkipList<T> {
                     }
                 }
                 self.len -= 1;
+                boxed_node.value
+            } else {
+                None
             }
         }
     }

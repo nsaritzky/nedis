@@ -6,7 +6,7 @@ use once_cell::sync::Lazy;
 use crate::{
     command_handler::CommandHandler, list::{BLPopHandler, LLenHandler, LPopHandler, LPushHandler, LRangeHandler, RPushHandler}, pubsub::{PublishHandler, SubscribeHandler, UnsubscribeHandler}, replication::{PSyncHandler, ReplConfHandler, WaitHandler}, set::{SADDHandler, SCARDHandler, SINTERHandler, SISMEMBERHandler, SREMHandler}, simple_handlers::{
         ConfigHandler, ConstantHandler, EchoHandler, EmptyHandler, EmptyRDBHandler, GetHandler, InfoHandler, KeysHandler, PingHandler, SetHandler, TypeHandler
-    }, sorted_set::{ZADDHandler, ZCardHandler, ZRangeHandler, ZRankHandler, ZScoreHandler}, stream::{XADDHandler, XRangeHandler, XReadHandler}, transactions::{IncrHandler, MultiHandler}
+    }, sorted_set::{ZADDHandler, ZCardHandler, ZRangeHandler, ZRankHandler, ZRemHandler, ZScoreHandler}, stream::{XADDHandler, XRangeHandler, XReadHandler}, transactions::{IncrHandler, MultiHandler}
 };
 
 pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + Sync>>> =
@@ -56,5 +56,6 @@ pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + 
         registry.insert("ZRANGE", Box::new(ZRangeHandler));
         registry.insert("ZCARD", Box::new(ZCardHandler));
         registry.insert("ZSCORE", Box::new(ZScoreHandler));
+        registry.insert("ZREM", Box::new(ZRemHandler));
         registry
     });

@@ -128,9 +128,11 @@ impl<'a, T: Ord + Debug + Eq + Hash + Clone + Default> SortedSet<T> {
             .collect()
     }
 
-    pub fn remove(&mut self, value: &T) {
+    pub fn remove(&mut self, value: &T) -> Option<(OrdFloat, T)> {
         if let Some(ord_float) = self.hash_map.remove(value) {
-            self.skip_list.delete(&(ord_float, value.clone()));
+            self.skip_list.delete(&(ord_float, value.clone()))
+        } else {
+            None
         }
     }
 
@@ -299,6 +301,38 @@ impl CommandHandler for ZScoreHandler {
              Ok(vec![RedisResponse::Str(score.to_string()).to_bytes()])
          } else {
              Ok(vec!["$-1\r\n".into()])
+         }
+     }
+}
+
+pub struct ZRemHandler;
+#[async_trait]
+impl CommandHandler for ZRemHandler {
+     async fn execute(
+        &self,
+        args: Vec<String>,
+        mut server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+     ) -> anyhow::Result<Vec<Bytes>> {
+         if args.len() != 3 {
+             bail!("ZREM: Wrong number of args");
+         }
+         let [_command, zset_key, zset_item] = args.try_into().unwrap();
+
+         let entry = server_state.db.entry(zset_key).await;
+         if let ShardMapEntry::Occupied(mut occ) = entry {
+             if let (DbValue::ZSet(zset), _) = occ.get_mut() {
+                 if zset.remove(&zset_item).is_some() {
+                     Ok(vec![":1\r\n".into()])
+                 } else {
+                     Ok(vec![":0\r\n".into()])
+                 }
+             } else {
+                 bail!("ZREM: Value at key is not a zset");
+             }
+         } else {
+             Ok(vec![":0\r\n".into()])
          }
      }
 }
