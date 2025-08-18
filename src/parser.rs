@@ -5,7 +5,10 @@ use std::{
     str::FromStr,
 };
 
-use crate::redis_value::{PrimitiveRedisValue, RedisValue};
+use crate::{
+    redis_value::{PrimitiveRedisValue, RedisValue},
+    EMPTY_RDB_BYTES,
+};
 use num::BigInt;
 use winnow::{
     ascii::{crlf, dec_int, dec_uint, digit1, float},
@@ -21,7 +24,11 @@ use winnow::{
 pub fn parse_multiple_resp_arrays_of_strings_with_len(
     input: &mut &[u8],
 ) -> Result<Vec<(Vec<String>, usize)>> {
-    repeat(0.., parse_with_len(parse_resp_array_of_strings)).parse_next(input)
+    repeat(0.., parse_with_len(parse_strings_or_rdb)).parse_next(input)
+}
+
+pub fn parse_strings_or_rdb(input: &mut &[u8]) -> Result<Vec<String>> {
+    alt((parse_empty_rdb, parse_resp_array_of_strings)).parse_next(input)
 }
 
 pub fn parse_resp_array_of_strings(input: &mut &[u8]) -> Result<Vec<String>> {
@@ -64,6 +71,15 @@ pub fn parse_value<'a>(input: &mut &'a [u8]) -> Result<RedisValue> {
             _ => fail::<_, RedisValue, _>
     }
     .parse_next(input)
+}
+
+fn parse_empty_rdb(input: &mut &[u8]) -> Result<Vec<String>> {
+    if input.len() >= EMPTY_RDB_BYTES.len() && input[0..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES {
+        let _ = input.split_off(..EMPTY_RDB_BYTES.len());
+        Ok(vec!["EMPTY_RDB_FILE".to_string()])
+    } else {
+        fail::<_, Vec<String>, _>(input)
+    }
 }
 
 fn parse_with_len<Input, Output, Error, ParseNext>(

@@ -219,17 +219,8 @@ async fn process(
                 match input_len {
                     Ok(0) => break,
                     Ok(n) => {
-                        if n >= EMPTY_RDB_BYTES.len() &&
-                            (buf[..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES) {
-                                println!("Received RDB file; resetting offset");
-                                let _ = buf.split_to(EMPTY_RDB_BYTES.len());
-                                server_state.init_offset();
-                            }
-                        println!("Buffer: {}", String::from_utf8_lossy(&buf));
                         let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
                             .map_err(|e| anyhow!("Parsing error: {}", e))?;
-
-                        println!("Parsed results: {results:?}");
 
                         let server_state = server_state.clone();
                         let connection_state = connection_state.clone();
@@ -270,7 +261,7 @@ async fn process(
 async fn process_input(
     results: Vec<(Vec<String>, usize)>,
     mut server_state: ServerState,
-    connection_state: ConnectionState,
+    mut connection_state: ConnectionState,
 ) -> anyhow::Result<()> {
     // let commands_nonempty = !results.is_empty();
     for (args, message_len) in results {
@@ -302,6 +293,10 @@ async fn process_input(
                     for resp in handle_discard(connection_state.clone()).await {
                         connection_state.stream_tx.send(resp).await?;
                     }
+                }
+                "EMPTY_RDB_FILE" => {
+                    println!("Received empty RDB file. Resetting offset.");
+                    server_state.init_offset();
                 }
                 _ => {
                     for resp in queue_command(connection_state.clone(), message_len, args).await {

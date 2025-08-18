@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
+use futures::io::Empty;
 use once_cell::sync::Lazy;
 
 use crate::{
     command_handler::CommandHandler, list::{BLPopHandler, LLenHandler, LPopHandler, LPushHandler, LRangeHandler, RPushHandler}, pubsub::{PublishHandler, SubscribeHandler, UnsubscribeHandler}, replication::{PSyncHandler, ReplConfHandler, WaitHandler}, set::{SADDHandler, SCARDHandler, SINTERHandler, SISMEMBERHandler, SREMHandler}, simple_handlers::{
-        ConfigHandler, ConstantHandler, EchoHandler, GetHandler, InfoHandler, KeysHandler,
-        PingHandler, SetHandler, TypeHandler,
+        ConfigHandler, ConstantHandler, EchoHandler, EmptyHandler, EmptyRDBHandler, GetHandler, InfoHandler, KeysHandler, PingHandler, SetHandler, TypeHandler
     }, sorted_set::{ZADDHandler, ZRankHandler}, stream::{XADDHandler, XRangeHandler, XReadHandler}, transactions::{IncrHandler, MultiHandler}
 };
 
@@ -52,5 +52,6 @@ pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + 
         registry.insert("PUBLISH", Box::new(PublishHandler));
         registry.insert("ZADD", Box::new(ZADDHandler));
         registry.insert("ZRANK", Box::new(ZRankHandler));
+        registry.insert("EMPTY_RDB_FILE", Box::new(EmptyRDBHandler));
         registry
     });

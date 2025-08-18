@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures::io::Empty;
 
 use crate::{
     command_handler::CommandHandler,
@@ -248,5 +249,34 @@ impl CommandHandler for ConstantHandler {
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
         Ok(self.0.clone())
+    }
+}
+
+pub struct EmptyHandler;
+#[async_trait]
+impl CommandHandler for EmptyHandler {
+    async fn execute(
+        &self,
+        _args: Vec<String>,
+        _server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+    ) -> anyhow::Result<Vec<Bytes>> {
+        Ok(vec![])
+    }
+}
+
+pub struct EmptyRDBHandler;
+#[async_trait]
+impl CommandHandler for EmptyRDBHandler {
+    async fn execute(
+        &self,
+        _args: Vec<String>,
+        mut server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+    ) -> anyhow::Result<Vec<Bytes>> {
+        server_state.init_offset();
+        Ok(vec![])
     }
 }
