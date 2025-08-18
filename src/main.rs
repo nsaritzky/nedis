@@ -225,8 +225,11 @@ async fn process(
                                 let _ = buf.split_to(EMPTY_RDB_BYTES.len());
                                 server_state.init_offset();
                             }
+                        println!("Buffer: {}", String::from_utf8_lossy(&buf));
                         let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
-                            .map_err(|e| anyhow!(e))?;
+                            .map_err(|e| anyhow!("Parsing error: {}", e))?;
+
+                        println!("Parsed results: {results:?}");
 
                         let server_state = server_state.clone();
                         let connection_state = connection_state.clone();
