@@ -238,6 +238,7 @@ impl CommandHandler for ZRangeHandler {
                 } else {
                     max
                 } as usize;
+                println!("ZRange with real indices {min} and {max}");
                 zset.get_index_range(min, max)
             }
             Some(_) => bail!("ZRANGE: Value at key is not a zset"),
@@ -335,4 +336,19 @@ impl CommandHandler for ZRemHandler {
              Ok(vec![":0\r\n".into()])
          }
      }
+}
+
+#[cfg(test)]
+mod test {
+    use super::SortedSet;
+
+    #[test]
+    fn test_range() {
+        let mut zset = SortedSet::new();
+
+        zset.insert_or_update("hello", 2.0);
+        // zset.insert_or_update("hello again", 1.0);
+
+        println!("zrange 0 0: {:?}", zset.get_index_range(0, 0));
+    }
 }
