@@ -221,8 +221,8 @@ async fn process(
                     Ok(n) => {
                         if n >= EMPTY_RDB_BYTES.len() &&
                             (buf[..EMPTY_RDB_BYTES.len()] == *EMPTY_RDB_BYTES) {
-                                let _ = buf.split_to(EMPTY_RDB_BYTES.len());
                                 println!("Received RDB file; resetting offset");
+                                let _ = buf.split_to(EMPTY_RDB_BYTES.len());
                                 server_state.init_offset();
                             }
                         let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
@@ -361,6 +361,7 @@ pub async fn execute_command(
             .execute(v, server_state, connection_state, message_len)
             .await
     } else if command.starts_with("FULLRESYNC") {
+        println!("Got FULLRESYNC. Not responding.");
         Ok(vec![])
     } else {
         bail!("Invalid command: {command}")
