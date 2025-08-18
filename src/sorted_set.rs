@@ -272,3 +272,33 @@ impl CommandHandler for ZCardHandler {
         Ok(vec![RedisResponse::Int(result as isize).to_bytes()])
     }
 }
+
+pub struct ZScoreHandler;
+#[async_trait]
+impl CommandHandler for ZScoreHandler {
+     async fn execute(
+        &self,
+        args: Vec<String>,
+        server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+     ) -> anyhow::Result<Vec<Bytes>> {
+         if args.len() != 3 {
+             bail!("ZSCORE: Wrong number of args")
+         }
+         let [_command, zset_key, zset_item] = args.try_into().unwrap();
+
+         let value = server_state.db.get(&zset_key).await;
+         let score = match value.as_deref() {
+             Some((DbValue::ZSet(zset), _)) => zset.get_score(&zset_item),
+             Some(_) => bail!("ZSCORE: value at key is not a zset"),
+             None => None
+         };
+
+         if let Some(score) = score {
+             Ok(vec![RedisResponse::Str(score.to_string()).to_bytes()])
+         } else {
+             Ok(vec!["$-1\r\n".into()])
+         }
+     }
+}
