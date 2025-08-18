@@ -107,7 +107,7 @@ impl<T> SkipList<T> {
     }
 }
 
-impl<T: Ord + Debug + Clone> SkipList<T> {
+impl<T: Ord> SkipList<T> {
     pub fn search(&self, target: &T) -> Option<usize> {
         let mut node = self.head;
         let mut rank = 0;
@@ -312,7 +312,7 @@ impl<'a, T> IntoIterator for &'a mut SkipList<T> {
     }
 }
 
-impl<T: Clone + Ord + Debug> Clone for SkipList<T> {
+impl<T: Clone + Ord> Clone for SkipList<T> {
     fn clone(&self) -> Self {
         let mut res = SkipList::new();
         for v in self.iter() {
