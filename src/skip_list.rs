@@ -1,13 +1,13 @@
-use std::{borrow::Borrow, ptr::NonNull};
+use std::{borrow::Borrow, collections::VecDeque, ptr::NonNull};
 
 use rand::Rng;
 use std::fmt::Debug;
 
 const MAX_LEVELS: usize = 32;
 
-#[derive(Debug)]
 pub struct SkipList<T> {
     head: Link<T>,
+    tail: Link<T>,
     max_level: usize,
     len: usize,
 }
@@ -17,7 +17,7 @@ type Link<T> = NonNull<Node<T>>;
 #[derive(Clone, Debug)]
 struct Node<T> {
     value: Option<T>,
-    forward: Vec<Option<Link<T>>>,
+    forward: Vec<(Link<T>, usize)>,
 }
 
 pub struct IntoIter<T> {
@@ -35,63 +35,62 @@ pub struct IterMut<'a, T> {
 impl<T> SkipList<T> {
     pub fn new() -> Self {
         let max_level = 4;
+        let tail = unsafe {
+            NonNull::new_unchecked(Box::into_raw(Box::new(Node {
+                value: None,
+                forward: vec![],
+            })))
+        };
         let head = unsafe {
             NonNull::new_unchecked(Box::into_raw(Box::new(Node {
                 value: None,
-                forward: vec![None; max_level],
+                forward: vec![(tail, 1); max_level],
             })))
         };
         Self {
             head,
+            tail,
             max_level,
             len: 0,
         }
     }
 
     fn add_a_level(&mut self) {
-        if self.max_level < MAX_LEVELS {
-            unsafe {
-                (*self.head.as_ptr()).forward.push(None);
-                let mut current = self.forward(self.head)[0];
-                while let Some(node) = current {
-                    (*node.as_ptr()).forward.push(None);
-                    current = (&(*node.as_ptr())).forward[0];
-                }
+        unsafe {
+            if self.max_level < MAX_LEVELS {
+                (&mut (*self.head.as_ptr()))
+                    .forward
+                    .push((self.tail, self.len + 1));
+                self.max_level += 1;
             }
-            self.max_level += 1;
         }
     }
 
     fn pop_first(&mut self) -> Option<T> {
         unsafe {
-            self.forward(self.head)[0].and_then(|node| {
-                let boxed_node = Box::from_raw(node.as_ptr());
-                for i in 0..self.max_level {
-                    if self.forward(self.head)[i] == Some(node) {
-                        (&mut (*self.head.as_ptr())).forward[i] = boxed_node.forward[i];
-                    }
+            let (first_real_node, _) = (&(*self.head.as_ptr())).forward[0];
+            if (*first_real_node.as_ptr()).value.is_some() {
+                let boxed_node = Box::from_raw(first_real_node.as_ptr());
+                for i in 0..boxed_node.forward.len() {
+                    (&mut (*self.head.as_ptr())).forward[i] = boxed_node.forward[i];
                 }
                 self.len -= 1;
                 boxed_node.value
-            })
+            } else {
+                None
+            }
         }
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            next: unsafe {
-                let first_real_node = (&*self.head.as_ptr()).forward[0];
-                first_real_node.map(|node| node.as_ref())
-            }
+            next: unsafe { Some((&(*self.head.as_ptr())).forward[0].0.as_ref()) },
         }
     }
 
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
-            next: unsafe {
-                let first_real_node = (&*self.head.as_ptr()).forward[0];
-                first_real_node.map(|mut node| node.as_mut())
-            },
+            next: unsafe { Some((&mut (*self.head.as_ptr())).forward[0].0.as_mut()) },
         }
     }
 
@@ -99,120 +98,139 @@ impl<T> SkipList<T> {
         unsafe { (*node.as_ptr()).value.as_ref() }
     }
 
-    fn forward(&self, node: NonNull<Node<T>>) -> &Vec<Option<Link<T>>> {
+    fn forward(&self, node: NonNull<Node<T>>) -> &Vec<(Link<T>, usize)> {
         unsafe { (*node.as_ptr()).forward.as_ref() }
     }
 
-    fn forward_mut(&self, link: &mut Link<T>) -> &mut [Option<Link<T>>] {
+    fn forward_mut(&self, link: &mut Link<T>) -> &mut [(Link<T>, usize)] {
         unsafe { &mut (*link.as_ptr()).forward }
     }
 }
 
-
-impl<T: Ord> SkipList<T> {
-    pub fn search(&self, target: &T) -> bool {
+impl<T: Ord + Debug + Clone> SkipList<T> {
+    pub fn search(&self, target: &T) -> Option<usize> {
         let mut node = self.head;
+        let mut rank = 0;
 
         for i in (0..self.max_level).rev() {
-            let mut next = self.forward(node)[i];
-            while next.and_then(|n| self.value(n)).is_some_and(|v| v < target) {
-                node = next.unwrap();
-                next = self.forward(node)[i];
+            while let Some((next, span)) = self.forward(node).get(i) {
+                if self.value(*next).is_some_and(|v| v < target) {
+                    rank += span;
+                    node = *next;
+                } else {
+                    break;
+                }
             }
         }
 
-        let node = self.forward(node)[0];
-        node.map(|n| self.value(n))
-            .is_some_and(|v| v == Some(target))
+        let (node, _) = self.forward(node)[0];
+        if Some(target) == self.value(node) {
+            Some(rank)
+        } else {
+            None
+        }
     }
 
     pub fn insert(&mut self, to_insert: T) -> Option<&T> {
         if self.len >= 2usize.pow(self.max_level as u32 - 1) {
             self.add_a_level();
         }
+        unsafe {
+            let mut update = VecDeque::new();
+            let mut node = self.head;
+            let mut rank = 0usize;
 
-        let mut update = vec![None; self.max_level];
-        let mut node = self.head;
-
-        for i in (0..self.max_level).rev() {
-            let mut next = self.forward(node)[i];
-            while next
-                .and_then(|n| self.value(n))
-                .is_some_and(|v| v < &to_insert)
-            {
-                node = next.unwrap();
-                next = self.forward(node)[i];
+            for i in (0..self.max_level).rev() {
+                while let Some((next, span)) = self.forward(node).get(i) {
+                    if self.value(*next).is_some_and(|v| v < &to_insert) {
+                        rank += span;
+                        node = *next;
+                    } else {
+                        break;
+                    }
+                }
+                update.push_front((node, rank));
             }
-            update[i] = Some(node);
-        }
 
-        let node = self.forward(node)[0];
-        if node
-            .map(|n| self.value(n))
-            .is_some_and(|v| v == Some(&to_insert))
-        {
-            return None;
-        }
+            let (next_node, _) = self.forward(node)[0];
+            if (*next_node.as_ptr())
+                .value
+                .as_ref()
+                .is_some_and(|v| v == &to_insert)
+            {
+                return None;
+            }
 
-        let level = self.pick_a_level();
-        let mut new_node = unsafe {
-            NonNull::new_unchecked(Box::into_raw(Box::new(Node {
+            let new_node = NonNull::new_unchecked(Box::into_raw(Box::new(Node {
                 value: Some(to_insert),
-                forward: vec![None; self.max_level],
-            })))
-        };
+                forward: vec![],
+            })));
 
-        for i in 0..=level {
-            if let Some(mut update_i) = update[i] {
-                self.forward_mut(&mut new_node)[i] = self.forward(update_i)[i];
-                self.forward_mut(&mut update_i)[i] = Some(new_node);
-            } else {
-                unsafe {
-                    (&mut (*new_node.as_ptr())).forward[i] = self.forward(self.head)[i];
-                    (&mut (*self.head.as_ptr())).forward[i] = Some(new_node);
+            let new_forward = &mut (*new_node.as_ptr()).forward;
+            let level = self.pick_a_level();
+            for i in 0..=level {
+                let (update_i, offset_i) = update[i];
+                if let Some((next_i, old_span)) =
+                    &mut (&mut (*update_i.as_ptr())).forward.get_mut(i)
+                {
+                    new_forward.push((*next_i, *old_span - (rank - offset_i)));
+                    *next_i = new_node;
+                    *old_span = 1 + rank - offset_i;
+                } else {
+                    new_forward.push((self.tail, self.len + 1 - rank));
+                }
+                (&mut (*update_i.as_ptr())).forward[i].0 = new_node;
+            }
+            for i in (level + 1)..self.max_level {
+                let (update_i, _) = update[i];
+                if let Some((_, span_i)) = (&mut (*update_i.as_ptr())).forward.get_mut(i) {
+                    *span_i += 1;
                 }
             }
-        }
-        self.len += 1;
-        unsafe {
+            self.len += 1;
             new_node.as_ref().value.as_ref()
         }
     }
 
     pub fn delete<Q>(&mut self, to_delete: &Q)
-    where T: Borrow<Q>,
-    Q: Ord + ?Sized{
-        let mut update = vec![self.head; self.max_level];
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut update = VecDeque::new();
         let mut node = self.head;
+        let mut rank = 0;
 
-        for i in (0..self.max_level).rev() {
-            let mut next = self.forward(node)[i];
-            while next
-                .and_then(|n| self.value(n))
-                .is_some_and(|v| v.borrow() < to_delete)
-            {
-                node = next.unwrap();
-                next = self.forward(node)[i];
-            }
-            update[i] = node;
-        }
-
-        let node_to_delete = self.forward(node)[0];
-        if node_to_delete
-            .and_then(|n| self.value(n))
-            .is_some_and(|v| v.borrow() == to_delete)
-        {
-            for i in 0..self.max_level {
-                if self.forward(update[i])[i] == node_to_delete {
-                    self.forward_mut(&mut update[i])[i] = self.forward(node_to_delete.unwrap())[i];
-                } else {
-                    break;
+        unsafe {
+            for i in (0..self.max_level).rev() {
+                while let Some((next, span)) = self.forward(node).get(i) {
+                    if self.value(*next).is_some_and(|v| v.borrow() < to_delete) {
+                        rank += span;
+                        node = *next;
+                    } else {
+                        break;
+                    }
                 }
+                update.push_front((node, rank));
             }
-            unsafe {
-                drop(Box::from_raw(node_to_delete.unwrap().as_ptr()));
+
+            let (node_to_delete, _) = (&(*node.as_ptr())).forward[0];
+            if (*node_to_delete.as_ptr())
+                .value
+                .as_ref()
+                .is_some_and(|v| v.borrow() == to_delete)
+            {
+                let boxed_node = Box::from_raw(node_to_delete.as_ptr());
+                for i in 0..self.max_level {
+                    let (update_i, offset_i) = update[i];
+                    let (forward_i, span_i) = &mut (&mut (*update_i.as_ptr())).forward[i];
+                    if *forward_i == node_to_delete {
+                        *forward_i = boxed_node.forward[i].0;
+                        *span_i = (rank - offset_i) + boxed_node.forward[i].1 - 1;
+                    }
+                }
+                self.len -= 1;
             }
-            self.len -= 1;
         }
     }
 
@@ -221,14 +239,18 @@ impl<T: Ord> SkipList<T> {
     }
 }
 
+impl<T: Debug> Debug for SkipList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 impl<T> Drop for SkipList<T> {
     fn drop(&mut self) {
+        while self.pop_first().is_some() {}
         unsafe {
-            let mut current = Some(self.head);
-            while let Some(node) = current {
-                let boxed_node = Box::from_raw(node.as_ptr());
-                current = boxed_node.forward[0];
-            }
+            let _ = Box::from_raw(self.head.as_ptr());
+            let _ = Box::from_raw(self.tail.as_ptr());
         }
     }
 }
@@ -246,7 +268,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next.and_then(|node| unsafe {
-            self.next = node.forward[0].map(|n| &(*n.as_ptr()));
+            self.next = node.forward.get(0).map(|(ptr, _)| &*ptr.as_ptr());
             node.value.as_ref()
         })
     }
@@ -257,7 +279,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next.take().and_then(|node| unsafe {
-            self.next = node.forward[0].map(|n| &mut (*n.as_ptr()));
+            self.next = node.forward.get(0).map(|(ptr, _)| &mut *ptr.as_ptr());
             node.value.as_mut()
         })
     }
@@ -328,6 +350,8 @@ impl<T> SkipList<T> {
 mod test {
     use std::sync::{Arc, Mutex};
 
+    use rand::seq::SliceRandom;
+
     use super::SkipList;
 
     #[test]
@@ -344,14 +368,18 @@ mod test {
         skip_list.insert(10);
         assert_eq!(skip_list.len(), 3);
 
-        assert!(skip_list.search(&10));
+        assert_eq!(skip_list.search(&10), Some(1));
 
         skip_list.delete(&10);
         assert_eq!(skip_list.len(), 2);
 
-        assert!(!skip_list.search(&10));
+        assert!(skip_list.search(&10).is_none());
+        assert_eq!(skip_list.search(&17), Some(1));
 
-        for i in 100..125 {
+        let mut rng = rand::rng();
+        let mut indices = (100..200).collect::<Vec<_>>();
+        indices.shuffle(&mut rng);
+        for i in indices {
             skip_list.insert(i);
         }
     }
@@ -360,15 +388,18 @@ mod test {
     fn test_into_iter() {
         let mut skip_list = SkipList::new();
 
-        for i in 0..10 {
+        let mut indices: Vec<_> = (0..10).collect();
+        let mut rng = rand::rng();
+        indices.shuffle(&mut rng);
+        for i in indices {
             skip_list.insert(i);
         }
 
-        println!("Calling into_iter implicitly");
+        println!("Calling into_iter");
         let mut count = 0;
         for (index, value) in skip_list.into_iter().enumerate() {
             count += 1;
-            assert!(index == value);
+            assert_eq!(index, value);
         }
         assert_eq!(count, 10);
     }
@@ -377,16 +408,19 @@ mod test {
     fn test_iter() {
         let mut skip_list = SkipList::new();
 
-        for i in 0..10 {
+        let mut items: Vec<_> = (0..10).collect();
+        let mut rng = rand::rng();
+        items.shuffle(&mut rng);
+        for i in items {
             skip_list.insert(i);
         }
 
-        println!("Calling iter implicitly");
+        println!("Calling iter");
         let mut count = 0;
         for (index, value) in skip_list.iter().enumerate() {
             count += 1;
             assert_eq!(index, *value);
-            println!("Iter found {value}");
+            assert_eq!(skip_list.search(value), Some(index));
         }
         assert_eq!(count, 10);
     }
@@ -399,7 +433,7 @@ mod test {
             skip_list.insert(i);
         }
 
-        println!("Calling iter implicitly");
+        println!("Calling iter_mut");
         let mut count = 0;
         for (index, value) in skip_list.iter_mut().enumerate() {
             *value += 1;
@@ -420,7 +454,10 @@ mod test {
 
         // Create a scenario where the same node might be referenced
         // multiple times in the forward vectors due to the random level assignment
-        for i in 0..100 {
+        let mut indices: Vec<_> = (0..100).collect();
+        let mut rng = rand::rng();
+        indices.shuffle(&mut rng);
+        for i in indices {
             skip_list.insert(i);
         }
 

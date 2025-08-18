@@ -2,7 +2,14 @@ use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{command_handler::CommandHandler, db_value::DbValue, response::RedisResponse, shard_map::ShardMapEntry, skip_list::SkipList, state::{ConnectionState, ServerState}};
+use crate::{
+    command_handler::CommandHandler,
+    db_value::DbValue,
+    response::RedisResponse,
+    shard_map::ShardMapEntry,
+    skip_list::SkipList,
+    state::{ConnectionState, ServerState},
+};
 
 use std::{borrow::Borrow, collections::HashMap, fmt::Debug, hash::Hash};
 
@@ -60,27 +67,27 @@ impl<K: Ord, V> Ord for KeyTuple<K, V> {
 }
 
 #[derive(Clone, Debug)]
-pub struct SortedSet<T: Debug + Eq + Hash> {
-    skip_list: SkipList<KeyTuple<OrdFloat, T>>,
-    hash_map: HashMap<T, OrdFloat>
+pub struct SortedSet<T: Ord + Debug + Eq + Hash> {
+    skip_list: SkipList<(OrdFloat, T)>,
+    hash_map: HashMap<T, OrdFloat>,
 }
 
-impl<'a, T: Debug + Eq + Hash + Clone> SortedSet<T> {
+impl<'a, T: Ord + Debug + Eq + Hash + Clone> SortedSet<T> {
     pub fn new() -> Self {
         Self {
             skip_list: SkipList::new(),
-            hash_map: HashMap::new()
+            hash_map: HashMap::new(),
         }
     }
 
     pub fn insert_or_update(&mut self, value: T, score: f64) -> bool {
         let ord_float = OrdFloat::new(score);
         if let Some(old_score) = self.hash_map.insert(value.clone(), ord_float) {
-            self.skip_list.delete(&KeyTuple(old_score, value.clone()));
-            self.skip_list.insert(KeyTuple(ord_float, value.clone()));
+            self.skip_list.delete(&(old_score, value.clone()));
+            self.skip_list.insert((ord_float, value.clone()));
             true
         } else {
-            self.skip_list.insert(KeyTuple(ord_float, value));
+            self.skip_list.insert((ord_float, value));
             false
         }
     }
@@ -93,9 +100,15 @@ impl<'a, T: Debug + Eq + Hash + Clone> SortedSet<T> {
         self.hash_map.get(value).map(|score| score.to_float())
     }
 
+    pub fn get_rank(&self, value: &T) -> Option<usize> {
+        self.hash_map
+            .get(value)
+            .and_then(|score| self.skip_list.search(&(*score, value.clone())))
+    }
+
     pub fn remove(&mut self, value: &T) {
         if let Some(ord_float) = self.hash_map.remove(value) {
-            self.skip_list.delete(&KeyTuple(ord_float, value.clone()));
+            self.skip_list.delete(&(ord_float, value.clone()));
         }
     }
 
@@ -112,7 +125,7 @@ impl CommandHandler for ZADDHandler {
         args: Vec<String>,
         mut server_state: ServerState,
         _connection_state: ConnectionState,
-        _message_len: usize
+        _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
         if args.len() != 4 {
             bail!("ZADD: Wrong number of arguments");
@@ -121,18 +134,16 @@ impl CommandHandler for ZADDHandler {
         let score: f64 = score.parse().unwrap();
 
         let count = match server_state.db.entry(key).await {
-            ShardMapEntry::Occupied(mut occ) => {
-                match occ.get_mut() {
-                    (DbValue::ZSet(zset), _) => {
-                        if zset.insert_or_update(value, score) {
-                            0
-                        } else {
-                            1
-                        }
+            ShardMapEntry::Occupied(mut occ) => match occ.get_mut() {
+                (DbValue::ZSet(zset), _) => {
+                    if zset.insert_or_update(value, score) {
+                        0
+                    } else {
+                        1
                     }
-                    _ => bail!("ZADD: Value at key is not a zset"),
                 }
-            }
+                _ => bail!("ZADD: Value at key is not a zset"),
+            },
             ShardMapEntry::Vacant(vac) => {
                 let mut zset = SortedSet::new();
                 zset.insert_or_update(value, score);
@@ -142,5 +153,33 @@ impl CommandHandler for ZADDHandler {
         };
 
         Ok(vec![RedisResponse::Int(count as isize).to_bytes()])
+    }
+}
+
+pub struct ZRankHandler;
+#[async_trait]
+impl CommandHandler for ZRankHandler {
+    async fn execute(
+        &self,
+        args: Vec<String>,
+        server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+    ) -> anyhow::Result<Vec<Bytes>> {
+        if args.len() != 3 {
+            bail!("ZRANK: Wrong number of args");
+        }
+        let [_command, zset_key, zset_item] = args.try_into().unwrap();
+
+        match server_state.db.get(&zset_key).await.as_deref() {
+            Some((DbValue::ZSet(zset), _)) => {
+                if let Some(rank) = zset.get_rank(&zset_item) {
+                    Ok(vec![RedisResponse::Int(rank as isize).to_bytes()])
+                } else {
+                    Ok(vec!["$-1\r\n".into()])
+                }
+            },
+            _ => Ok(vec!["$-1\r\n".into()])
+        }
     }
 }
