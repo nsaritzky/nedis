@@ -107,7 +107,7 @@ impl<T> SkipList<T> {
     }
 }
 
-impl<T: Ord> SkipList<T> {
+impl<T: Ord + Debug> SkipList<T> {
     pub fn search(&self, target: &T) -> Option<usize> {
         let mut node = self.head;
         let mut rank = 0;
@@ -234,8 +234,61 @@ impl<T: Ord> SkipList<T> {
         }
     }
 
+    pub fn get_starting_at(&'_ self, min: &T) -> Iter<'_, T> {
+        let (update, _) = self.find(min);
+        let (node, _) = update[0];
+        unsafe {
+            Iter {
+                next: node.as_ptr().as_ref(),
+            }
+        }
+    }
+
+    pub fn from_nth<'a>(&'a self, index: usize) -> Iter<'a, T> {
+        let mut node = self.head;
+        let mut rank = 0;
+        for i in (0..self.max_level).rev() {
+            while let Some((next, span)) = self.forward(node).get(i) {
+                if rank + span <= index + 1 {
+                    node = *next;
+                    rank += span;
+                } else {
+                    break;
+                }
+            }
+        }
+        unsafe {
+            Iter {
+                next: node.as_ptr().as_ref(),
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    fn find<Q>(&self, value: &Q) -> (Vec<(Link<T>, usize)>, usize)
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut update = VecDeque::new();
+        let mut node = self.head;
+        let mut rank = 0usize;
+
+        for i in (0..self.max_level).rev() {
+            while let Some((next, span)) = self.forward(node).get(i) {
+                if self.value(*next).is_some_and(|v| v.borrow() < value) {
+                    rank += span;
+                    node = *next;
+                } else {
+                    break;
+                }
+            }
+            update.push_front((node, rank));
+        }
+        (update.into(), rank)
     }
 }
 
@@ -312,7 +365,7 @@ impl<'a, T> IntoIterator for &'a mut SkipList<T> {
     }
 }
 
-impl<T: Clone + Ord> Clone for SkipList<T> {
+impl<T: Clone + Ord + Debug> Clone for SkipList<T> {
     fn clone(&self) -> Self {
         let mut res = SkipList::new();
         for v in self.iter() {

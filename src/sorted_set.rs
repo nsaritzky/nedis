@@ -72,7 +72,7 @@ pub struct SortedSet<T: Ord + Debug + Eq + Hash> {
     hash_map: HashMap<T, OrdFloat>,
 }
 
-impl<'a, T: Ord + Debug + Eq + Hash + Clone> SortedSet<T> {
+impl<'a, T: Ord + Debug + Eq + Hash + Clone + Default> SortedSet<T> {
     pub fn new() -> Self {
         Self {
             skip_list: SkipList::new(),
@@ -104,6 +104,28 @@ impl<'a, T: Ord + Debug + Eq + Hash + Clone> SortedSet<T> {
         self.hash_map
             .get(value)
             .and_then(|score| self.skip_list.search(&(*score, value.clone())))
+    }
+
+    pub fn get_range(&self, min: OrdFloat, max: OrdFloat) -> Vec<&T> {
+        if min > max {
+            return vec![];
+        }
+        self.skip_list
+            .get_starting_at(&(min, T::default()))
+            .take_while(|&&(score, _)| score < max)
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    pub fn get_index_range(&self, a: usize, b: usize) -> Vec<&T> {
+        if a > b {
+            return vec![]
+        }
+        self.skip_list
+            .from_nth(a)
+            .take(b - a + 1)
+            .map(|(_, value)| value)
+            .collect()
     }
 
     pub fn remove(&mut self, value: &T) {
@@ -178,8 +200,37 @@ impl CommandHandler for ZRankHandler {
                 } else {
                     Ok(vec!["$-1\r\n".into()])
                 }
-            },
-            _ => Ok(vec!["$-1\r\n".into()])
+            }
+            _ => Ok(vec!["$-1\r\n".into()]),
         }
+    }
+}
+
+pub struct ZRangeHandler;
+#[async_trait]
+impl CommandHandler for ZRangeHandler {
+    async fn execute(
+        &self,
+        args: Vec<String>,
+        server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+    ) -> anyhow::Result<Vec<Bytes>> {
+        if args.len() != 4 {
+            bail!("ZRANGE: Wrong number of args");
+        }
+        let [_command, redis_key, min, max] = args.try_into().unwrap();
+        let min: usize = min.parse().unwrap();
+        let max: usize = max.parse().unwrap();
+
+        let value = server_state.db.get(&redis_key).await;
+        let result = match value.as_deref() {
+            Some((DbValue::ZSet(zset), _)) => zset.get_index_range(min, max),
+            Some(_) => bail!("ZRANGE: Value at key is not a zset"),
+            None => vec![]
+        };
+
+        let resp: RedisResponse = result.into_iter().collect();
+        Ok(vec![resp.to_bytes()])
     }
 }
