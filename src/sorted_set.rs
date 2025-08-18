@@ -119,7 +119,7 @@ impl<'a, T: Ord + Debug + Eq + Hash + Clone + Default> SortedSet<T> {
 
     pub fn get_index_range(&self, a: usize, b: usize) -> Vec<&T> {
         if a > b {
-            return vec![]
+            return vec![];
         }
         self.skip_list
             .from_nth(a)
@@ -220,14 +220,26 @@ impl CommandHandler for ZRangeHandler {
             bail!("ZRANGE: Wrong number of args");
         }
         let [_command, redis_key, min, max] = args.try_into().unwrap();
-        let min: usize = min.parse().unwrap();
-        let max: usize = max.parse().unwrap();
+        let min: isize = min.parse().unwrap();
+        let max: isize = max.parse().unwrap();
 
         let value = server_state.db.get(&redis_key).await;
         let result = match value.as_deref() {
-            Some((DbValue::ZSet(zset), _)) => zset.get_index_range(min, max),
+            Some((DbValue::ZSet(zset), _)) => {
+                let min = if min < 0 {
+                    zset.len() as isize + min
+                } else {
+                    min
+                } as usize;
+                let max = if max < 0 {
+                    zset.len() as isize + max
+                } else {
+                    max
+                } as usize;
+                zset.get_index_range(min, max)
+            }
             Some(_) => bail!("ZRANGE: Value at key is not a zset"),
-            None => vec![]
+            None => vec![],
         };
 
         let resp: RedisResponse = result.into_iter().collect();

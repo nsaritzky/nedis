@@ -89,11 +89,10 @@ fn parse_string(input: &mut &[u8]) -> Result<String> {
         LengthEncodingResult::Int(n) => take(n)
             .map(|inp| {
                 let res = String::from_utf8_lossy(inp).to_string();
-                println!("parsed {res}");
                 res
             })
             .parse_next(input),
-        LengthEncodingResult::Str(s) => {println!("parsed {s}"); Ok(s)},
+        LengthEncodingResult::Str(s) => Ok(s),
     }
 }
 
