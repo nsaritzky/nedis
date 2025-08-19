@@ -1,12 +1,22 @@
 use std::collections::HashMap;
 
-use futures::io::Empty;
 use once_cell::sync::Lazy;
 
 use crate::{
-    command_handler::CommandHandler, list::{BLPopHandler, LLenHandler, LPopHandler, LPushHandler, LRangeHandler, RPushHandler}, pubsub::{PublishHandler, SubscribeHandler, UnsubscribeHandler}, replication::{PSyncHandler, ReplConfHandler, WaitHandler}, set::{SADDHandler, SCARDHandler, SINTERHandler, SISMEMBERHandler, SREMHandler}, simple_handlers::{
-        ConfigHandler, ConstantHandler, EchoHandler, EmptyHandler, EmptyRDBHandler, GetHandler, InfoHandler, KeysHandler, PingHandler, SetHandler, TypeHandler
-    }, sorted_set::{ZADDHandler, ZCardHandler, ZRangeHandler, ZRankHandler, ZRemHandler, ZScoreHandler}, stream::{XADDHandler, XRangeHandler, XReadHandler}, transactions::{IncrHandler, MultiHandler}
+    command_handler::CommandHandler,
+    list::{BLPopHandler, LLenHandler, LPopHandler, LPushHandler, LRangeHandler, RPushHandler},
+    pubsub::{PublishHandler, SubscribeHandler, UnsubscribeHandler},
+    replication::{PSyncHandler, ReplConfHandler, WaitHandler},
+    set::{SADDHandler, SCARDHandler, SINTERHandler, SISMEMBERHandler, SREMHandler},
+    simple_handlers::{
+        ConfigHandler, ConstantHandler, EchoHandler, EmptyHandler, EmptyRDBHandler, GetHandler,
+        InfoHandler, KeysHandler, PingHandler, SetHandler, TypeHandler,
+    },
+    sorted_set::{
+        ZADDHandler, ZCardHandler, ZRangeHandler, ZRankHandler, ZRemHandler, ZScoreHandler,
+    },
+    stream::{XADDHandler, XRangeHandler, XReadHandler},
+    transactions::{IncrHandler, MultiHandler, UnwatchHandler, WatchHandler},
 };
 
 pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + Sync>>> =
@@ -40,7 +50,9 @@ pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + 
         );
         registry.insert(
             "DISCARD",
-            Box::new(ConstantHandler(vec!["-ERR DISCARD without MULTI\r\n".into()])),
+            Box::new(ConstantHandler(vec![
+                "-ERR DISCARD without MULTI\r\n".into()
+            ])),
         );
         registry.insert("PSYNC", Box::new(PSyncHandler));
         registry.insert("REPLCONF", Box::new(ReplConfHandler));
@@ -57,5 +69,7 @@ pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + 
         registry.insert("ZCARD", Box::new(ZCardHandler));
         registry.insert("ZSCORE", Box::new(ZScoreHandler));
         registry.insert("ZREM", Box::new(ZRemHandler));
+        registry.insert("WATCH", Box::new(WatchHandler));
+        registry.insert("UNWATCH", Box::new(UnwatchHandler));
         registry
     });

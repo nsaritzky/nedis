@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, collections::VecDeque, ptr::NonNull};
+use std::{borrow::Borrow, collections::VecDeque, hash::{Hash, Hasher}, ptr::NonNull};
 
 use rand::Rng;
 use std::fmt::Debug;
@@ -26,10 +26,12 @@ pub struct IntoIter<T> {
 
 pub struct Iter<'a, T> {
     next: Option<&'a Node<T>>,
+    len: usize,
 }
 
 pub struct IterMut<'a, T> {
     next: Option<&'a mut Node<T>>,
+    len: usize,
 }
 
 impl<T> SkipList<T> {
@@ -85,13 +87,19 @@ impl<T> SkipList<T> {
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
             next: unsafe { Some((&(*self.head.as_ptr())).forward[0].0.as_ref()) },
+            len: self.len,
         }
     }
 
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
             next: unsafe { Some((&mut (*self.head.as_ptr())).forward[0].0.as_mut()) },
+            len: self.len,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     fn value(&self, node: NonNull<Node<T>>) -> Option<&T> {
@@ -107,7 +115,7 @@ impl<T> SkipList<T> {
     }
 }
 
-impl<T: Ord + Debug> SkipList<T> {
+impl<T: Ord> SkipList<T> {
     pub fn search(&self, target: &T) -> Option<usize> {
         let mut node = self.head;
         let mut rank = 0;
@@ -136,28 +144,11 @@ impl<T: Ord + Debug> SkipList<T> {
             self.add_a_level();
         }
         unsafe {
-            let mut update = VecDeque::new();
-            let mut node = self.head;
-            let mut rank = 0usize;
-
-            for i in (0..self.max_level).rev() {
-                while let Some((next, span)) = self.forward(node).get(i) {
-                    if self.value(*next).is_some_and(|v| v < &to_insert) {
-                        rank += span;
-                        node = *next;
-                    } else {
-                        break;
-                    }
-                }
-                update.push_front((node, rank));
-            }
+            let (update, rank) = self.find(&to_insert);
+            let (node, _) = update[0];
 
             let (next_node, _) = self.forward(node)[0];
-            if (*next_node.as_ptr())
-                .value
-                .as_ref()
-                .is_some_and(|v| v == &to_insert)
-            {
+            if self.value(next_node).is_some_and(|v| v == &to_insert) {
                 return None;
             }
 
@@ -197,24 +188,11 @@ impl<T: Ord + Debug> SkipList<T> {
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut update = VecDeque::new();
-        let mut node = self.head;
-        let mut rank = 0;
-
         unsafe {
-            for i in (0..self.max_level).rev() {
-                while let Some((next, span)) = self.forward(node).get(i) {
-                    if self.value(*next).is_some_and(|v| v.borrow() < to_delete) {
-                        rank += span;
-                        node = *next;
-                    } else {
-                        break;
-                    }
-                }
-                update.push_front((node, rank));
-            }
+            let (update, rank) = self.find(to_delete);
+            let (node, _) = update[0];
 
-            let (node_to_delete, _) = (&(*node.as_ptr())).forward[0];
+            let (node_to_delete, _) = self.forward(node)[0];
             if (*node_to_delete.as_ptr())
                 .value
                 .as_ref()
@@ -241,11 +219,12 @@ impl<T: Ord + Debug> SkipList<T> {
     }
 
     pub fn get_starting_at(&'_ self, min: &T) -> Iter<'_, T> {
-        let (update, _) = self.find(min);
+        let (update, rank) = self.find(min);
         let (node, _) = update[0];
         unsafe {
             Iter {
                 next: node.as_ptr().as_ref(),
+                len: self.len - rank
             }
         }
     }
@@ -255,7 +234,6 @@ impl<T: Ord + Debug> SkipList<T> {
         let mut rank = 0;
         for i in (0..self.max_level).rev() {
             while let Some((next, span)) = self.forward(node).get(i) {
-                println!("Span {span} at value {:?} at level {i}", self.value(node));
                 if rank + span <= index + 1 {
                     node = *next;
                     rank += span;
@@ -264,16 +242,12 @@ impl<T: Ord + Debug> SkipList<T> {
                 }
             }
         }
-        println!("Iter head value {:?} at rank {rank}", self.value(node));
         unsafe {
             Iter {
                 next: node.as_ptr().as_ref(),
+                len: self.len - index
             }
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
     }
 
     fn find<Q>(&self, value: &Q) -> (Vec<(Link<T>, usize)>, usize)
@@ -322,6 +296,22 @@ impl<T> Iterator for IntoIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         self.list.pop_first()
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.list.len, Some(self.list.len))
+    }
+}
+
+impl<T> ExactSizeIterator for IntoIter<T> {
+    fn len(&self) -> usize {
+        let (lower, upper) = self.size_hint();
+        // Note: This assertion is overly defensive, but it checks the invariant
+        // guaranteed by the trait. If this trait were rust-internal,
+        // we could use debug_assert!; assert_eq! will check all Rust user
+        // implementations too.
+        std::assert_eq!(upper, Some(lower));
+        lower
+    }
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -333,6 +323,10 @@ impl<'a, T> Iterator for Iter<'a, T> {
             node.value.as_ref()
         })
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
 }
 
 impl<'a, T> Iterator for IterMut<'a, T> {
@@ -343,6 +337,10 @@ impl<'a, T> Iterator for IterMut<'a, T> {
             self.next = node.forward.get(0).map(|(ptr, _)| &mut *ptr.as_ptr());
             node.value.as_mut()
         })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
     }
 }
 
@@ -373,13 +371,36 @@ impl<'a, T> IntoIterator for &'a mut SkipList<T> {
     }
 }
 
-impl<T: Clone + Ord + Debug> Clone for SkipList<T> {
+impl<T: Clone + Ord> Clone for SkipList<T> {
     fn clone(&self) -> Self {
         let mut res = SkipList::new();
         for v in self.iter() {
             res.insert(v.clone());
         }
         res
+    }
+}
+
+impl<T> Default for SkipList<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: PartialEq> PartialEq for SkipList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other)
+    }
+}
+
+impl<T: Eq> Eq for SkipList<T> {}
+
+impl<T: Hash> Hash for SkipList<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        for item in self {
+            item.hash(state);
+        }
     }
 }
 
@@ -392,18 +413,11 @@ unsafe impl<T: Sync> Sync for Iter<'_, T> {}
 unsafe impl<T: Send> Send for IterMut<'_, T> {}
 unsafe impl<T: Sync> Sync for IterMut<'_, T> {}
 
-fn flip_a_coin() -> bool {
-    let mut rng = rand::rng();
-    rng.random_range(0.0..1.0) < 0.5
-}
-
 impl<T> SkipList<T> {
     fn pick_a_level(&self) -> usize {
-        let mut res = 0;
-        while flip_a_coin() && res < self.max_level - 1 {
-            res += 1;
-        }
-        res
+        let mut rng = rand::rng();
+        let x: f32 = rng.random_range(0.0..1.0);
+        ((self.max_level - 1) as f32).min(-1.0 * x.log2()) as usize
     }
 }
 

@@ -9,5 +9,5 @@ pub struct Args {
     #[arg(long)]
     pub dir: Option<String>,
     #[arg(long)]
-    pub dbfilename: Option<String>
+    pub dbfilename: Option<String>,
 }

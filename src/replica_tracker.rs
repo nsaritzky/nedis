@@ -1,16 +1,19 @@
-use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 #[derive(Debug)]
 pub struct ReplicaTracker {
     pub offsets: HashMap<usize, usize>,
-    next_id: AtomicUsize
+    next_id: AtomicUsize,
 }
 
 impl ReplicaTracker {
     pub fn new() -> Self {
         ReplicaTracker {
             offsets: HashMap::new(),
-            next_id: AtomicUsize::new(0)
+            next_id: AtomicUsize::new(0),
         }
     }
 

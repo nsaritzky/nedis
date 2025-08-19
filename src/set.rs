@@ -6,6 +6,7 @@ use bytes::Bytes;
 
 use crate::{
     command_handler::CommandHandler,
+    db_item::DbItem,
     db_value::DbValue,
     response::RedisResponse,
     shard_map::ShardMapEntry,
@@ -29,21 +30,31 @@ impl CommandHandler for SADDHandler {
         let key = drain.next().unwrap();
         let members: HashSet<_> = drain.collect();
 
-        let size = match server_state.db.entry(key).await {
+        let size;
+        match server_state.db.entry(key).await {
             ShardMapEntry::Occupied(mut occ) => {
-                if let (DbValue::Set(ref mut set), _) = occ.get_mut() {
+                let item = occ.get_mut();
+                let mut update_flag = false;
+                if let DbValue::Set(ref mut set) = item.value_mut() {
                     for member in members {
-                        set.insert(member);
+                        if set.insert(member) {
+                            update_flag = true;
+                        };
                     }
-                    set.len()
+                    size = set.len()
                 } else {
                     bail!("SADD: Value at key is not a set")
                 }
+                if update_flag {
+                    item.update_timestamp();
+                }
             }
             ShardMapEntry::Vacant(vac) => {
-                let size = members.len();
-                vac.insert((DbValue::Set(members.into_iter().collect()), None));
-                size
+                size = members.len();
+                vac.insert(DbItem::new(
+                    DbValue::Set(members.into_iter().collect()),
+                    None,
+                ));
             }
         };
 
@@ -69,15 +80,20 @@ impl CommandHandler for SREMHandler {
         let key = drain.next().unwrap();
         let members: HashSet<_> = drain.collect();
 
-        let result = match server_state.db.entry(key).await {
+        let result;
+        match server_state.db.entry(key).await {
             ShardMapEntry::Occupied(mut occ) => {
-                if let (DbValue::Set(ref mut set), _) = occ.get_mut() {
-                    set.extract_if(|item| members.contains(item)).count()
+                let item = occ.get_mut();
+                if let DbValue::Set(ref mut set) = item.value_mut() {
+                    result = set.extract_if(|item| members.contains(item)).count()
                 } else {
                     bail!("SREM: Value at key is not a set")
                 }
+                if result > 0 {
+                    item.update_timestamp();
+                }
             }
-            ShardMapEntry::Vacant(_) => 0,
+            ShardMapEntry::Vacant(_) => result = 0,
         };
 
         let resp = RedisResponse::Int(result as isize);
@@ -91,7 +107,7 @@ impl CommandHandler for SISMEMBERHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -100,7 +116,7 @@ impl CommandHandler for SISMEMBERHandler {
 
         let value = server_state.db.get(&key).await;
         let result = match value.as_deref() {
-            Some((DbValue::Set(set), _)) => set.contains(&entry),
+            Some(DbValue::Set(set)) => set.contains(&entry),
             Some(_) => bail!("SISMEMBER: Value at key is not a set"),
             None => false,
         };
@@ -128,22 +144,24 @@ impl CommandHandler for SINTERHandler {
         let [_, key1, key2] =
             <[String; 3]>::try_from(args).map_err(|_| anyhow!("SINTER: Wrong number of args"))?;
 
-        let value1 = server_state.db.get(&key1).await;
-        let value2 = server_state.db.get(&key2).await;
+        let result = server_state.db.with_values(&[key1.clone(), key2.clone()], |values| {
+            let item1 = values[0];
+            let item2 = values[1];
+            let value1 = item1.map(|it| it.value());
+            let value2 = item2.map(|it| it.value());
 
-        let result = match (value1.as_deref(), value2.as_deref()) {
-            (Some((DbValue::Set(set1), _)), Some((DbValue::Set(set2), _))) => {
-                set1.intersection(set2).collect()
+            match (value1, value2) {
+                (Some(DbValue::Set(set1)), Some(DbValue::Set(set2))) => {
+                    Ok(set1.intersection(set2).cloned().collect())
+                }
+                (Some(DbValue::Set(_)), None) | (None, Some(DbValue::Set(_))) | (None, None) => {
+                    Ok(vec![])
+                }
+                (Some(_), Some(_)) => bail!("SINTER: Values at keys are not sets"),
+                (Some(_), None) => bail!("SINTER: Value at key {key1} is not a set"),
+                (None, Some(_)) => bail!("SINTER: Value at key {key2} is not a set"),
             }
-            (Some((DbValue::Set(_), _)), None)
-            | (None, Some((DbValue::Set(_), _)))
-            | (None, None) => {
-                vec![]
-            }
-            (Some(_), Some(_)) => bail!("SINTER: Values at keys are not sets"),
-            (Some(_), None) => bail!("SINTER: Value at key {key1} is not a set"),
-            (None, Some(_)) => bail!("SINTER: Value at key {key2} is not a set"),
-        };
+        }).await?;
 
         let resp: RedisResponse = result.into_iter().collect();
 
@@ -157,7 +175,7 @@ impl CommandHandler for SCARDHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -165,7 +183,7 @@ impl CommandHandler for SCARDHandler {
             let value = server_state.db.get(key).await;
 
             let result = match value.as_deref() {
-                Some((DbValue::Set(set), _)) => set.len(),
+                Some(DbValue::Set(set)) => set.len(),
                 Some(_) => bail!("SCARD: Value at key is not a set"),
                 None => 0,
             };

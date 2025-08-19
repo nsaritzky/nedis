@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use indexmap::IndexMap;
 
-use crate::{skip_list::SkipList, sorted_set::SortedSet};
+use crate::sorted_set::SortedSet;
 
 #[derive(Debug, Clone)]
 pub enum DbValue {
@@ -11,7 +11,8 @@ pub enum DbValue {
     Stream(Vec<StreamElement>),
     Hash(HashMap<String, String>),
     Set(HashSet<String>),
-    ZSet(SortedSet<String>)
+    ZSet(SortedSet<String>),
+    Empty,
 }
 
 impl DbValue {
@@ -53,6 +54,12 @@ impl DbValue {
         } else {
             None
         }
+    }
+}
+
+impl Default for DbValue {
+    fn default() -> Self {
+        DbValue::Empty
     }
 }
 

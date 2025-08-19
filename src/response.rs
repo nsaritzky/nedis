@@ -6,6 +6,7 @@ pub enum RedisResponse {
     Str(String),
     Int(isize),
     List(Vec<RedisResponse>),
+    Nil,
 }
 
 impl RedisResponse {
@@ -21,6 +22,7 @@ impl RedisResponse {
                 }
                 buf.freeze()
             }
+            RedisResponse::Nil => "$-1\r\n".into(),
         }
     }
 
@@ -66,6 +68,12 @@ impl<'a> FromIterator<&'a String> for RedisResponse {
     }
 }
 
+impl FromIterator<String> for RedisResponse {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        RedisResponse::List(iter.into_iter().map(|s| s.into()).collect())
+    }
+}
+
 impl From<&DbValue> for RedisResponse {
     fn from(value: &DbValue) -> Self {
         match value {
@@ -95,12 +103,13 @@ impl From<&DbValue> for RedisResponse {
             ),
             DbValue::Set(set) => set.iter().collect(),
             DbValue::ZSet(set) => unimplemented!(),
+            DbValue::Empty => RedisResponse::Nil,
         }
     }
 }
 
-impl From<Vec<&mut StreamElement>> for RedisResponse {
-    fn from(value: Vec<&mut StreamElement>) -> Self {
+impl From<Vec<&StreamElement>> for RedisResponse {
+    fn from(value: Vec<&StreamElement>) -> Self {
         RedisResponse::List(
             value
                 .into_iter()

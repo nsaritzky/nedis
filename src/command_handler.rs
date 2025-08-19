@@ -10,6 +10,6 @@ pub trait CommandHandler {
         mut args: Vec<String>,
         mut server_state: ServerState,
         mut connection_state: ConnectionState,
-        message_len: usize
+        message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>>;
 }

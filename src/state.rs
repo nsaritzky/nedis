@@ -14,9 +14,10 @@ use either::Either;
 use futures::future::join_all;
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
-use crate::{db_value::DbValue, replica_tracker::ReplicaTracker, shard_map::ShardMap};
+use crate::{
+    db::Db, db_item::DbItem, db_value::DbValue, replica_tracker::ReplicaTracker, shard_map::ShardMap
+};
 
-type Db = ShardMap<String, (DbValue, Option<SystemTime>)>;
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
 type TransactionQueue = Arc<Mutex<Vec<(Vec<String>, usize)>>>;
 type Subscriptions =
@@ -29,6 +30,7 @@ pub struct ServerState {
     pub blocks: Blocks,
     subscriptions: Subscriptions,
     next_connection_id: Arc<AtomicUsize>,
+    pub transaction_lock: Arc<RwLock<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +49,7 @@ impl ServerState {
     pub fn new(
         is_master: bool,
         replica_tx: Option<broadcast::Sender<Bytes>>,
-        db: Option<HashMap<String, (DbValue, Option<SystemTime>)>>
+        db: Option<HashMap<String, DbItem>>,
     ) -> Self {
         ServerState {
             state: if is_master {
@@ -58,12 +60,13 @@ impl ServerState {
                 Either::Right(ReplicaState::new())
             },
             db: match db {
-                Some(db) => ShardMap::from_hash_map(16, db),
-                None => ShardMap::new(16)
+                Some(db) => Db::new(ShardMap::from_hash_map(16, db)),
+                None => Db::new(ShardMap::new(16)),
             },
             blocks: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
+            transaction_lock: Arc::new(RwLock::new(())),
         }
     }
 
@@ -236,6 +239,7 @@ pub struct ConnectionState {
     pub stream_tx: mpsc::Sender<Bytes>,
     subscriptions: Arc<RwLock<HashMap<String, broadcast::Sender<SubscriptionMessage>>>>,
     subscribed_mode: Arc<AtomicBool>,
+    watched_keys: Arc<RwLock<HashMap<String, SystemTime>>>,
 }
 
 impl ConnectionState {
@@ -250,6 +254,7 @@ impl ConnectionState {
             stream_tx,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             subscribed_mode: Arc::new(AtomicBool::new(false)),
+            watched_keys: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -329,6 +334,18 @@ impl ConnectionState {
 
     pub fn get_connection_id(&self) -> usize {
         self.id
+    }
+
+    pub async fn watch_keys(&mut self, keys: Vec<String>) {
+        let mut watched_keys = self.watched_keys.write().await;
+        for key in keys {
+            watched_keys.insert(key, SystemTime::now());
+        }
+    }
+
+    pub async fn drain_watched_keys(&mut self) -> HashMap<String, SystemTime> {
+        let mut watched_keys = self.watched_keys.write().await;
+        std::mem::take(&mut *watched_keys)
     }
 }
 

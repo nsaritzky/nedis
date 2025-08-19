@@ -3,12 +3,13 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::io::Empty;
 
 use crate::{
     command_handler::CommandHandler,
+    db_item::DbItem,
     db_value::DbValue,
     response::RedisResponse,
+    shard_map::ShardMapEntry,
     state::{ConnectionState, ServerState},
     utils::bulk_string,
     GLOBAL_CONFIG,
@@ -54,7 +55,7 @@ impl CommandHandler for SetHandler {
     async fn execute(
         &self,
         mut args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -64,8 +65,6 @@ impl CommandHandler for SetHandler {
         };
 
         if let (Some(key), Some(value)) = (key, value) {
-            let mut db = server_state.db;
-
             match args.get(1) {
                 Some(s) if s.to_ascii_uppercase() == "PX" => {
                     let expires_in: u64 = args[2].parse()?;
@@ -75,11 +74,16 @@ impl CommandHandler for SetHandler {
                         .checked_add(Duration::from_millis(expires_in))
                         .ok_or(anyhow!("SET: Invalid expires durartion"))?;
 
-                    db.insert(key, (DbValue::String(value), Some(expires)))
+                    server_state
+                        .db
+                        .insert(key, DbItem::new(DbValue::String(value), Some(expires)))
                         .await;
                 }
                 _ => {
-                    db.insert(key, (DbValue::String(value), None)).await;
+                    server_state
+                        .db
+                        .insert(key, DbItem::new(DbValue::String(value), None))
+                        .await;
                 }
             }
             Ok(vec!["+OK\r\n".into()])
@@ -101,20 +105,11 @@ impl CommandHandler for GetHandler {
     ) -> anyhow::Result<Vec<Bytes>> {
         let key = &args[1];
 
-        let mut entry = server_state.db.entry(key.to_string()).await;
-        if let Some((value, expiry)) = entry.get() {
-            if let Some(expiry) = expiry {
-                if *expiry < SystemTime::now() {
-                    entry.remove();
-                    Ok(vec!["$-1\r\n".into()])
-                } else {
-                    Ok(vec![RedisResponse::from(value).to_bytes()])
-                }
-            } else {
-                Ok(vec![RedisResponse::from(value).to_bytes()])
-            }
-        } else {
-            Ok(vec!["$-1\r\n".into()])
+        let value = server_state.db.get(key).await;
+        match value.as_deref() {
+            Some(DbValue::String(s)) => Ok(vec![RedisResponse::Str(s.to_string()).to_bytes()]),
+            Some(_) => bail!("GET: Value at key is not a string"),
+            None => Ok(vec!["$-1\r\n".into()]),
         }
     }
 }
@@ -125,23 +120,19 @@ impl CommandHandler for TypeHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
         if let Some(key) = args.get(1) {
-            let db = server_state.db;
-
-            let value = db.get(key).await;
+            let value = server_state.db.get(key).await;
             match value.as_deref() {
-                Some((DbValue::String(_), _)) | Some((DbValue::List(_), _)) => {
-                    Ok(vec!["+string\r\n".into()])
-                }
-                Some((DbValue::Stream(_), _)) => Ok(vec!["+stream\r\n".into()]),
-                Some((DbValue::Hash(_), _)) => Ok(vec!["+hash\r\n".into()]),
-                Some((DbValue::Set(_), _)) => Ok(vec!["+set\r\n".into()]),
-                Some((DbValue::ZSet(_), _)) => Ok(vec!["+zset\r\n".into()]),
-                None => Ok(vec!["+none\r\n".into()]),
+                Some(DbValue::String(_)) | Some(DbValue::List(_)) => Ok(vec!["+string\r\n".into()]),
+                Some(DbValue::Stream(_)) => Ok(vec!["+stream\r\n".into()]),
+                Some(DbValue::Hash(_)) => Ok(vec!["+hash\r\n".into()]),
+                Some(DbValue::Set(_)) => Ok(vec!["+set\r\n".into()]),
+                Some(DbValue::ZSet(_)) => Ok(vec!["+zset\r\n".into()]),
+                None | Some(DbValue::Empty) => Ok(vec!["+none\r\n".into()]),
             }
         } else {
             bail!("TYPE: No key");
@@ -223,9 +214,9 @@ impl CommandHandler for KeysHandler {
         let now = SystemTime::now();
         server_state
             .db
-            .retain(|k, (_, expires)| {
-                if expires.is_none_or(|exp| exp >= now) {
-                    values_buf.extend_from_slice(&RedisResponse::Str(k.clone()).to_bytes());
+            .retain(|key, item| {
+                if item.expires_at().is_none_or(|exp| exp >= now) {
+                    values_buf.extend_from_slice(&RedisResponse::Str(key.clone()).to_bytes());
                     true
                 } else {
                     false

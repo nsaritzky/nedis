@@ -1,32 +1,34 @@
 mod args;
 mod command_handler;
+mod command_registry;
+mod db;
+mod db_item;
 mod db_value;
 mod global_config;
 mod hash;
 mod hex;
 mod list;
 mod parser;
+mod pubsub;
 mod rdb_parser;
 mod redis_value;
 mod replica_tracker;
+mod replication;
 mod response;
 mod set;
 mod shard_map;
 mod simple_handlers;
-mod state;
-mod utils;
-mod stream;
-mod transactions;
-mod replication;
-mod pubsub;
-mod command_registry;
 mod skip_list;
 mod sorted_set;
+mod state;
+mod stream;
+mod transactions;
+mod utils;
 
 use std::{
     future,
     sync::{LazyLock, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crate::args::Args;
@@ -37,16 +39,17 @@ use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use command_registry::REGISTRY;
 use global_config::{GlobalConfig, MasterConfig, SlaveConfig};
+use itertools::Itertools;
 use rdb_parser::parse_db;
 use response::RedisResponse;
 use state::{ConnectionState, ConnectionType, ServerState};
+use tokio::sync::broadcast;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{broadcast::error::RecvError, mpsc},
     time::interval,
 };
-use tokio::sync::broadcast;
 
 const EMPTY_RDB_FILE: &str = include_str!("../resources/empty_rdb.hex");
 pub const EMPTY_RDB_BYTES: LazyLock<Bytes> = LazyLock::new(|| {
@@ -218,7 +221,7 @@ async fn process(
             input_len = stream_reader.read_buf(&mut buf) => {
                 match input_len {
                     Ok(0) => break,
-                    Ok(n) => {
+                    Ok(_) => {
                         let results = parse_multiple_resp_arrays_of_strings_with_len(&mut &buf[..])
                             .map_err(|e| anyhow!("Parsing error: {}", e))?;
 
@@ -261,7 +264,7 @@ async fn process(
 async fn process_input(
     results: Vec<(Vec<String>, usize)>,
     mut server_state: ServerState,
-    mut connection_state: ConnectionState,
+    connection_state: ConnectionState,
 ) -> anyhow::Result<()> {
     // let commands_nonempty = !results.is_empty();
     for (args, message_len) in results {
@@ -293,10 +296,6 @@ async fn process_input(
                     for resp in handle_discard(connection_state.clone()).await {
                         connection_state.stream_tx.send(resp).await?;
                     }
-                }
-                "EMPTY_RDB_FILE" => {
-                    println!("Received empty RDB file. Resetting offset.");
-                    server_state.init_offset();
                 }
                 _ => {
                     for resp in queue_command(connection_state.clone(), message_len, args).await {
@@ -337,12 +336,6 @@ async fn process_input(
         }
     }
 
-    // if connection_state.get_connection_type() == ConnectionType::ReplicaToMaster
-    //     && commands_nonempty
-    // {
-    //     send_ack(server_state, connection_state).await?;
-    // }
-
     Ok(())
 }
 
@@ -353,6 +346,7 @@ pub async fn execute_command(
     connection_state: ConnectionState,
 ) -> anyhow::Result<Vec<Bytes>> {
     let command = v[0].to_ascii_uppercase();
+    let _ = server_state.transaction_lock.read().await;
 
     if let Some(handler) = REGISTRY.get(command.as_str()) {
         handler
@@ -411,6 +405,25 @@ async fn handle_exec(
         let mut tq = cs.transaction_queue.lock().await;
         tq.drain(..).collect()
     };
+    let _ = server_state.transaction_lock.write().await;
+
+    // If any watched keys have been updated, abort the transaction
+    let watched_keys = connection_state.drain_watched_keys().await;
+    let keys = watched_keys.keys().map(|s| s.as_str()).collect_vec();
+    if !server_state
+        .db
+        .with_key_values(&keys, |pairs| {
+            pairs.into_iter().all(|(key, item)| {
+                item.is_some_and(|it| {
+                    it.expires_at().is_none_or(|t| t < SystemTime::now())
+                        && it.updated_at() <= *watched_keys.get(*key).unwrap()
+                })
+            })
+        })
+        .await
+    {
+        return Ok(vec!["$-1\r\n".into()]);
+    }
 
     buf.put_slice(format!("*{}\r\n", transactions.len()).as_bytes());
 

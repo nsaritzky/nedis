@@ -1,27 +1,34 @@
 use either::Either;
 
-
 #[derive(Debug)]
 pub struct GlobalConfig {
     config: Either<MasterConfig, SlaveConfig>,
     pub dir: Option<String>,
-    pub dbfilename: Option<String>
+    pub dbfilename: Option<String>,
 }
 
 impl GlobalConfig {
-    pub fn new_from_master_config(config: MasterConfig, dir: Option<String>, dbfilename: Option<String>) -> Self {
+    pub fn new_from_master_config(
+        config: MasterConfig,
+        dir: Option<String>,
+        dbfilename: Option<String>,
+    ) -> Self {
         GlobalConfig {
             config: Either::Left(config),
             dir,
-            dbfilename
+            dbfilename,
         }
     }
 
-    pub fn new_from_slave_config(config: SlaveConfig, dir: Option<String>, dbfilename: Option<String>) -> Self {
+    pub fn new_from_slave_config(
+        config: SlaveConfig,
+        dir: Option<String>,
+        dbfilename: Option<String>,
+    ) -> Self {
         GlobalConfig {
             config: Either::Right(config),
             dir,
-            dbfilename
+            dbfilename,
         }
     }
 
@@ -52,7 +59,7 @@ impl SlaveConfig {
     pub fn new(master_address: String, master_port: usize) -> Self {
         SlaveConfig {
             master_address,
-            master_port
+            master_port,
         }
     }
 }
@@ -65,7 +72,7 @@ pub struct MasterConfig {
 impl MasterConfig {
     pub fn new() -> Self {
         MasterConfig {
-            replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string()
+            replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
         }
     }
 }

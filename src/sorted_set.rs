@@ -5,6 +5,7 @@ use futures::stream::select_all::Iter;
 
 use crate::{
     command_handler::CommandHandler,
+    db_item::DbItem,
     db_value::DbValue,
     response::RedisResponse,
     shard_map::ShardMapEntry,
@@ -51,7 +52,7 @@ pub struct SortedSet<T: Ord + Debug + Eq + Hash> {
 }
 
 pub struct ZsetIter<'a, T: Ord + Debug + Eq + Hash> {
-    iter: crate::skip_list::Iter<'a, (OrdFloat, T)>
+    iter: crate::skip_list::Iter<'a, (OrdFloat, T)>,
 }
 
 impl<'a, T: Ord + Debug + Eq + Hash> Iterator for ZsetIter<'a, T> {
@@ -128,7 +129,7 @@ impl<'a, T: Ord + Debug + Eq + Hash + Clone + Default> SortedSet<T> {
 
     pub fn iter(&self) -> ZsetIter<'_, T> {
         ZsetIter {
-            iter: self.skip_list.iter()
+            iter: self.skip_list.iter(),
         }
     }
 
@@ -153,22 +154,29 @@ impl CommandHandler for ZADDHandler {
         let [_command, key, score, value] = args.try_into().unwrap();
         let score: f64 = score.parse().unwrap();
 
-        let count = match server_state.db.entry(key).await {
-            ShardMapEntry::Occupied(mut occ) => match occ.get_mut() {
-                (DbValue::ZSet(zset), _) => {
-                    if zset.insert_or_update(value, score) {
-                        0
-                    } else {
-                        1
+        let count;
+        match server_state.db.entry(key).await {
+            ShardMapEntry::Occupied(mut occ) => {
+                let item = occ.get_mut();
+                match item.value_mut() {
+                    DbValue::ZSet(zset) => {
+                        if zset.insert_or_update(value, score) {
+                            count = 0;
+                        } else {
+                            count = 1;
+                        }
                     }
+                    _ => bail!("ZADD: Value at key is not a zset"),
                 }
-                _ => bail!("ZADD: Value at key is not a zset"),
-            },
+                if count == 1 {
+                    item.update_timestamp();
+                }
+            }
             ShardMapEntry::Vacant(vac) => {
                 let mut zset = SortedSet::new();
                 zset.insert_or_update(value, score);
-                vac.insert((DbValue::ZSet(zset), None));
-                1
+                vac.insert(DbItem::new(DbValue::ZSet(zset), None));
+                count = 1;
             }
         };
 
@@ -182,7 +190,7 @@ impl CommandHandler for ZRankHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -191,15 +199,18 @@ impl CommandHandler for ZRankHandler {
         }
         let [_command, zset_key, zset_item] = args.try_into().unwrap();
 
-        match server_state.db.get(&zset_key).await.as_deref() {
-            Some((DbValue::ZSet(zset), _)) => {
+        let value = server_state.db.get(&zset_key).await;
+
+        match value.as_deref() {
+            Some(DbValue::ZSet(zset)) => {
                 if let Some(rank) = zset.get_rank(&zset_item) {
                     Ok(vec![RedisResponse::Int(rank as isize).to_bytes()])
                 } else {
                     Ok(vec!["$-1\r\n".into()])
                 }
             }
-            _ => Ok(vec!["$-1\r\n".into()]),
+            Some(_) => bail!("ZRANK: Value at key is not a zset"),
+            None => Ok(vec!["$-1\r\n".into()]),
         }
     }
 }
@@ -210,7 +221,7 @@ impl CommandHandler for ZRangeHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -223,7 +234,7 @@ impl CommandHandler for ZRangeHandler {
 
         let value = server_state.db.get(&redis_key).await;
         let result = match value.as_deref() {
-            Some((DbValue::ZSet(zset), _)) => {
+            Some(DbValue::ZSet(zset)) => {
                 let min = if min < 0 {
                     0.max(zset.len() as isize + min)
                 } else {
@@ -251,7 +262,7 @@ impl CommandHandler for ZCardHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -262,9 +273,9 @@ impl CommandHandler for ZCardHandler {
 
         let value = server_state.db.get(&redis_key).await;
         let result = match value.as_deref() {
-            Some((DbValue::ZSet(zset), _)) => zset.len(),
+            Some(DbValue::ZSet(zset)) => zset.len(),
             Some(_) => bail!("ZCARD: Value at key is not a zset"),
-            None => 0
+            None => 0,
         };
 
         Ok(vec![RedisResponse::Int(result as isize).to_bytes()])
@@ -274,63 +285,67 @@ impl CommandHandler for ZCardHandler {
 pub struct ZScoreHandler;
 #[async_trait]
 impl CommandHandler for ZScoreHandler {
-     async fn execute(
-        &self,
-        args: Vec<String>,
-        server_state: ServerState,
-        _connection_state: ConnectionState,
-        _message_len: usize,
-     ) -> anyhow::Result<Vec<Bytes>> {
-         if args.len() != 3 {
-             bail!("ZSCORE: Wrong number of args")
-         }
-         let [_command, zset_key, zset_item] = args.try_into().unwrap();
-
-         let value = server_state.db.get(&zset_key).await;
-         let score = match value.as_deref() {
-             Some((DbValue::ZSet(zset), _)) => zset.get_score(&zset_item),
-             Some(_) => bail!("ZSCORE: value at key is not a zset"),
-             None => None
-         };
-
-         if let Some(score) = score {
-             Ok(vec![RedisResponse::Str(score.to_string()).to_bytes()])
-         } else {
-             Ok(vec!["$-1\r\n".into()])
-         }
-     }
-}
-
-pub struct ZRemHandler;
-#[async_trait]
-impl CommandHandler for ZRemHandler {
-     async fn execute(
+    async fn execute(
         &self,
         args: Vec<String>,
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-     ) -> anyhow::Result<Vec<Bytes>> {
-         if args.len() != 3 {
-             bail!("ZREM: Wrong number of args");
-         }
-         let [_command, zset_key, zset_item] = args.try_into().unwrap();
+    ) -> anyhow::Result<Vec<Bytes>> {
+        if args.len() != 3 {
+            bail!("ZSCORE: Wrong number of args")
+        }
+        let [_command, zset_key, zset_item] = args.try_into().unwrap();
 
-         let entry = server_state.db.entry(zset_key).await;
-         if let ShardMapEntry::Occupied(mut occ) = entry {
-             if let (DbValue::ZSet(zset), _) = occ.get_mut() {
-                 if zset.remove(&zset_item).is_some() {
-                     Ok(vec![":1\r\n".into()])
-                 } else {
-                     Ok(vec![":0\r\n".into()])
-                 }
-             } else {
-                 bail!("ZREM: Value at key is not a zset");
-             }
-         } else {
-             Ok(vec![":0\r\n".into()])
-         }
-     }
+        let value = server_state.db.get(&zset_key).await;
+        let score = match value.as_deref() {
+            Some(DbValue::ZSet(zset)) => zset.get_score(&zset_item),
+            Some(_) => bail!("ZSCORE: value at key is not a zset"),
+            None => None,
+        };
+
+        if let Some(score) = score {
+            Ok(vec![RedisResponse::Str(score.to_string()).to_bytes()])
+        } else {
+            Ok(vec!["$-1\r\n".into()])
+        }
+    }
+}
+
+pub struct ZRemHandler;
+#[async_trait]
+impl CommandHandler for ZRemHandler {
+    async fn execute(
+        &self,
+        args: Vec<String>,
+        mut server_state: ServerState,
+        _connection_state: ConnectionState,
+        _message_len: usize,
+    ) -> anyhow::Result<Vec<Bytes>> {
+        if args.len() != 3 {
+            bail!("ZREM: Wrong number of args");
+        }
+        let [_command, zset_key, zset_item] = args.try_into().unwrap();
+
+        let entry = server_state.db.entry(zset_key).await;
+        if let ShardMapEntry::Occupied(mut occ) = entry {
+            let value = occ.get_mut().value_mut();
+            if let DbValue::ZSet(zset) = value {
+                if zset.remove(&zset_item).is_some() {
+                    if zset.len() == 0 {
+                        occ.remove();
+                    }
+                    Ok(vec![":1\r\n".into()])
+                } else {
+                    Ok(vec![":0\r\n".into()])
+                }
+            } else {
+                bail!("ZREM: Value at key is not a zset");
+            }
+        } else {
+            Ok(vec![":0\r\n".into()])
+        }
+    }
 }
 
 #[cfg(test)]

@@ -22,3 +22,6 @@ thiserror = "1.0.32"                                # error handling
 tokio = { version = "1.47.1", features = ["full"] } # async networking
 tokio-stream = "0.1.17"
 winnow = "0.7.12"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"

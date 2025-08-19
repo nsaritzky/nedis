@@ -11,7 +11,7 @@ use winnow::{
     Parser, Result,
 };
 
-use crate::db_value::DbValue;
+use crate::{db_item::DbItem, db_value::DbValue};
 
 const HEADER_STRING: [u8; 9] = *b"REDIS0011";
 const METADATA_HEADER: u8 = 0xFA;
@@ -43,7 +43,7 @@ impl From<String> for LengthEncodingResult {
     }
 }
 
-pub fn parse_db(input: &mut &[u8]) -> Result<HashMap<String, (DbValue, Option<SystemTime>)>> {
+pub fn parse_db(input: &mut &[u8]) -> Result<HashMap<String, DbItem>> {
     parse_header.parse_next(input)?;
     parse_metadata.void().parse_next(input)?;
     0xFE.void().parse_next(input)?;
@@ -53,7 +53,7 @@ pub fn parse_db(input: &mut &[u8]) -> Result<HashMap<String, (DbValue, Option<Sy
     let values: Vec<_> = repeat(0.., parse_data_entry).parse_next(input)?;
     let mut result = HashMap::new();
     for (expiry, (key, value)) in values {
-        result.insert(key, (value.into(), expiry));
+        result.insert(key, DbItem::new(value.into(), expiry));
     }
     parse_eof.void().parse_next(input)?;
     Ok(result)

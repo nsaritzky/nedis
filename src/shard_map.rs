@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::{
     borrow::Borrow,
     collections::{
@@ -107,11 +106,12 @@ where
         f(&results)
     }
 
-    async fn with_values_mut_raw<R, F, Q>(&self, keys: &[Q], f: F) -> R
-        where
+    pub async fn with_key_values<R, F, Q>(&self, keys: &[&Q], f: F) -> R
+    where
         K: Borrow<Q>,
-    Q: Eq + Hash,
-    F: FnOnce(&mut [Option<*mut V>]) -> R, {
+        Q: Eq + Hash + ?Sized,
+        F: FnOnce(&[(&Q, Option<&V>)]) -> R,
+    {
         let mut key_groups: HashMap<usize, Vec<(usize, &Q)>> = HashMap::new();
 
         for (original_idx, key) in keys.iter().enumerate() {
@@ -124,9 +124,43 @@ where
 
         let futures = key_groups
             .keys()
-            .map(|&shard_idx| async move {
-                (shard_idx, self.maps[shard_idx].write().await)
-            });
+            .map(|shard_idx| async move { (shard_idx, self.maps[*shard_idx].read().await) });
+
+        let guards = join_all(futures).await;
+
+        let guard_map: HashMap<_, _> = guards.iter().map(|(idx, guard)| (*idx, guard)).collect();
+
+        let results: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+                guard_map.get(&shard_idx).and_then(|guard| guard.get(key))
+            })
+            .collect();
+
+        let inputs: Vec<_> = keys.iter().map(|&k| k).zip(results).collect();
+        f(&inputs[..])
+    }
+
+    async fn with_values_mut_raw<R, F, Q>(&self, keys: &[Q], f: F) -> R
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+        F: FnOnce(&mut [Option<*mut V>]) -> R,
+    {
+        let mut key_groups: HashMap<usize, Vec<(usize, &Q)>> = HashMap::new();
+
+        for (original_idx, key) in keys.iter().enumerate() {
+            let shard_idx = Self::get_index_for_key(self.shard_count as u64, key);
+            key_groups
+                .entry(shard_idx)
+                .and_modify(|vec| vec.push((original_idx, key)))
+                .or_insert(vec![(original_idx, key)]);
+        }
+
+        let futures = key_groups
+            .keys()
+            .map(|&shard_idx| async move { (shard_idx, self.maps[shard_idx].write().await) });
 
         let mut guards = join_all(futures).await;
 
@@ -145,19 +179,20 @@ where
     }
 
     pub async fn with_values_mut<R, F, Q>(&self, keys: &[Q], f: F) -> R
-        where
+    where
         K: Borrow<Q>,
-    Q: Eq + Hash,
-    F: FnOnce(&mut [Option<&mut V>]) -> R, {
+        Q: Eq + Hash,
+        F: FnOnce(&mut [Option<&mut V>]) -> R,
+    {
         self.with_values_mut_raw(keys, |ptrs| {
-            let mut refs: Vec<Option<&mut V>> = ptrs.iter_mut()
-                .map(|ptr_opt| {
-                    ptr_opt.map(|ptr| unsafe { &mut *ptr })
-                })
+            let mut refs: Vec<Option<&mut V>> = ptrs
+                .iter_mut()
+                .map(|ptr_opt| ptr_opt.map(|ptr| unsafe { &mut *ptr }))
                 .collect();
 
             f(&mut refs)
-        }).await
+        })
+        .await
     }
 
     pub async fn with_values_owned<R, F, Q>(&self, keys: &[Q], f: F) -> R
@@ -215,6 +250,45 @@ where
     {
         let guard = self.get_bucket_mut(key).await;
         RwLockWriteGuard::try_map(guard, |m| m.get_mut(key)).ok()
+    }
+
+    pub async fn get_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<RwLockReadGuard<V>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+        F: FnOnce(&V) -> bool,
+    {
+        let mut guard = self.get_bucket_mut(key).await;
+        if let Some(value) = guard.get(key) {
+            if f(value) {
+                guard.remove(key);
+                None
+            } else {
+                let read_guard = guard.downgrade();
+                Some(RwLockReadGuard::map(read_guard, |g| g.get(key).unwrap()))
+            }
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_mut_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<RwLockMappedWriteGuard<V>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+        F: FnOnce(&V) -> bool,
+    {
+        let mut guard = self.get_bucket_mut(key).await;
+        if let Some(value) = guard.get(key) {
+            if f(value) {
+                guard.remove(key);
+                None
+            } else {
+                Some(RwLockWriteGuard::map(guard, |g| g.get_mut(key).unwrap()))
+            }
+        } else {
+            None
+        }
     }
 
     pub async fn insert(&mut self, key: K, value: V) -> Option<V> {

@@ -11,6 +11,7 @@ use tokio::time::interval;
 
 use crate::{
     command_handler::CommandHandler,
+    db_item::DbItem,
     db_value::{DbValue, StreamElement},
     response::RedisResponse,
     state::{ConnectionState, ServerState},
@@ -29,38 +30,44 @@ impl CommandHandler for XADDHandler {
         if let Some(key) = args.get(1) {
             server_state.db.with_entry(key.clone(), |entry| {
 
-            let (value, _) = entry.or_insert((DbValue::Stream(vec![]), None));
-            let stream_vec = value.to_stream_vec_mut().unwrap();
+                let item = entry.or_insert(DbItem::new(DbValue::Stream(vec![]), None));
 
-        if let Some(id) = args.get(2) {
-            let id = match generate_and_validate_stream_id(&stream_vec[..], id) {
-                Ok(id) => id,
-                Err(StreamIdValidationError::Zero) => {
-                    return Ok(vec![
-                        "-ERR The ID specified in XADD must be greater than 0-0\r\n".into(),
-                    ])
+                let result;
+                if let DbValue::Stream(ref mut stream_vec) = item.value_mut() {
+                    if let Some(id) = args.get(2) {
+                        let id = match generate_and_validate_stream_id(&stream_vec[..], id) {
+                            Ok(id) => id,
+                            Err(StreamIdValidationError::Zero) => {
+                                return Ok(vec![
+                                    "-ERR The ID specified in XADD must be greater than 0-0\r\n".into(),
+                                ]);
+                            }
+                            Err(StreamIdValidationError::DecreasingTimestamp)
+                                | Err(StreamIdValidationError::NonincreasingSequence) => {
+                                    return Ok(vec!["-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".into()]);
+                                }
+                            Err(e) => bail!(e),
+                        };
+
+                        let mut map = IndexMap::new();
+
+                        for (stream_key, value) in args.drain(3..).tuples() {
+                            map.insert(stream_key, value);
+                        }
+
+                        let new_stream_element = StreamElement::new(id.clone(), map);
+                        stream_vec.push(new_stream_element);
+
+                        result = Ok(vec![RedisResponse::Str(id).to_bytes()]);
+                    } else {
+                        bail!("Could not get id");
+                    }
+                } else {
+                    bail!("XADD: Value at key is not a stream");
                 }
-                Err(StreamIdValidationError::DecreasingTimestamp)
-                | Err(StreamIdValidationError::NonincreasingSequence) => {
-                    return Ok(vec!["-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".into()]);
-                }
-                Err(e) => bail!(e),
-            };
-
-            let mut map = IndexMap::new();
-
-            for (stream_key, value) in args.drain(3..).tuples() {
-                map.insert(stream_key, value);
-            }
-
-            let result = StreamElement::new(id.clone(), map);
-            stream_vec.push(result);
-
-            Ok(vec![RedisResponse::Str(id).to_bytes()])
-        } else {
-            bail!("Could not get id");
-        }
-        }).await
+                item.update_timestamp();
+                result
+            }).await
         } else {
             bail!("Could not extract key");
         }
@@ -73,7 +80,7 @@ impl CommandHandler for XRangeHandler {
     async fn execute(
         &self,
         mut args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -81,10 +88,9 @@ impl CommandHandler for XRangeHandler {
             bail!("XRANGE: Wrong number of arguments")
         }
         if let Some(key) = args.get(1) {
-            let mut db = server_state.db;
-
-            let mut value = db.get_mut(key).await;
-            if let Some((DbValue::Stream(stream_vec), _)) = value.as_deref_mut() {
+            let value = server_state.db.get(key).await;
+            match value.as_deref() {
+                Some(DbValue::Stream(stream_vec)) => {
                 let mut drain = args.drain(2..4);
                 let start = drain.next().unwrap();
                 let end = drain.next().unwrap();
@@ -143,8 +149,9 @@ impl CommandHandler for XRangeHandler {
                     }
                 }
                 Ok(vec![RedisResponse::from(result_vec).to_bytes()])
-            } else {
-                Ok(vec![RedisResponse::List(vec![]).to_bytes()])
+                }
+                Some(_) => bail!("XADD: Value at key is not a stream"),
+                None => Ok(vec![RedisResponse::List(vec![]).to_bytes()])
             }
         } else {
             bail!("XADD: No key argument")
@@ -158,7 +165,7 @@ impl CommandHandler for XReadHandler {
     async fn execute(
         &self,
         args: Vec<String>,
-        server_state: ServerState,
+        mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
@@ -188,9 +195,8 @@ impl CommandHandler for XReadHandler {
                 let start = &args[5];
 
                 let (start_timestamp, start_sequence) = {
-                    let db = server_state.clone().db;
-                    let value = db.get(key).await;
-                    let stream_vec = value.as_deref().and_then(|(val, _)| val.to_stream_vec());
+                    let value = server_state.db.get(key).await;
+                    let stream_vec = value.as_deref().and_then(|val| val.to_stream_vec());
                     parse_id_with_dollar_sign(&start, stream_vec)
                 };
 
@@ -202,7 +208,7 @@ impl CommandHandler for XReadHandler {
                     }
 
                     let value = server_state.db.get(key).await;
-                    if let Some((DbValue::Stream(stream_vec), _)) = value.as_deref() {
+                    if let Some(DbValue::Stream(stream_vec)) = value.as_deref() {
                         if let Some(last) = stream_vec.last() {
                             let (timestamp, sequence) = parse_id(&last.id);
                             if timestamp > start_timestamp
@@ -256,12 +262,12 @@ impl CommandHandler for XReadHandler {
                 let (start_timestamp, start_sequence) = parse_id(start);
                 gather_stream_read_results(
                     server_state
+                        .clone()
                         .db
                         .get(k)
                         .await
                         .as_deref()
-                        .unwrap_or(&(DbValue::Stream(vec![]), None))
-                        .0
+                        .unwrap_or(&DbValue::Stream(vec![]))
                         .to_stream_vec()
                         .expect("XREAD: a given key was not to a stream")
                         .iter()

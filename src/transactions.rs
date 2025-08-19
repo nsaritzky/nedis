@@ -5,10 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::{
-    command_handler::CommandHandler,
-    db_value::DbValue,
-    redis_value::RedisValue,
-    state::{ConnectionState, ServerState},
+    command_handler::CommandHandler, db_item::DbItem, db_value::DbValue, redis_value::RedisValue, state::{ConnectionState, ServerState}
 };
 
 pub struct IncrHandler;
@@ -30,9 +27,10 @@ impl CommandHandler for IncrHandler {
             .db
             .with_entry(key.clone(), |entry| match entry {
                 Entry::Occupied(mut occ) => {
-                    if let (DbValue::String(old_val), expired) = occ.get() {
+                    let item = occ.get();
+                    if let DbValue::String(old_val) = item.value() {
                         if let Ok(n) = old_val.parse::<isize>() {
-                            occ.insert((DbValue::String((n + 1).to_string()), *expired));
+                            occ.insert(DbItem::new(DbValue::String((n + 1).to_string()), item.expires_at()));
                             Some(n + 1)
                         } else {
                             None
@@ -42,7 +40,7 @@ impl CommandHandler for IncrHandler {
                     }
                 }
                 Entry::Vacant(vac) => {
-                    vac.insert((DbValue::String("1".to_string()), None));
+                    vac.insert(DbItem::new(DbValue::String("1".to_string()), None));
                     Some(1isize)
                 }
             })
@@ -71,5 +69,35 @@ impl CommandHandler for MultiHandler {
     ) -> anyhow::Result<Vec<Bytes>> {
         connection_state.set_transaction_active(true);
         Ok(vec!["+OK\r\n".into()])
+    }
+}
+
+pub struct WatchHandler;
+#[async_trait]
+impl CommandHandler for WatchHandler {
+    async fn execute(
+        &self,
+        mut args: Vec<String>,
+        _server_state: ServerState,
+        mut connection_state: ConnectionState,
+        _message_len: usize
+    ) -> anyhow::Result<Vec<Bytes>> {
+        connection_state.watch_keys(args.drain(1..).collect()).await;
+        Ok(vec!["+OK\r\n".into()])
+    }
+}
+
+pub struct UnwatchHandler;
+#[async_trait]
+impl CommandHandler for UnwatchHandler {
+    async fn execute(
+        &self,
+        _args: Vec<String>,
+        _server_state: ServerState,
+        mut connection_state: ConnectionState,
+        _message_len: usize
+    ) -> anyhow::Result<Vec<Bytes>> {
+        connection_state.drain_watched_keys().await;
+        Ok(vec!["$-1\r\n".into()])
     }
 }

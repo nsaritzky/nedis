@@ -1,6 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-};
+use std::collections::{HashMap, VecDeque};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num::BigInt;
