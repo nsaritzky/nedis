@@ -1,4 +1,5 @@
 mod args;
+mod blocking;
 mod command_handler;
 mod command_registry;
 mod db;
@@ -35,6 +36,7 @@ use crate::args::Args;
 use crate::hex::parse_hex_string;
 use crate::parser::parse_multiple_resp_arrays_of_strings_with_len;
 use anyhow::{anyhow, bail};
+use blocking::run_block_handler;
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use command_registry::REGISTRY;
@@ -107,15 +109,13 @@ async fn main() -> anyhow::Result<()> {
             tokio::fs::read(format!("{dir}/{dbfilename}"))
                 .await
                 .ok()
-                .and_then(|data| {
-                    parse_db(&mut &data[..])
-                        .map_err(|e| println!("parsing error: {e:?}"))
-                        .ok()
-                })
+                .and_then(|data| parse_db(&mut &data[..]).ok())
         } else {
             None
         }
     };
+
+    let (block_tx, block_rx) = mpsc::channel(100);
 
     let server_state = ServerState::new(
         is_master,
@@ -125,7 +125,11 @@ async fn main() -> anyhow::Result<()> {
             None
         },
         db,
+        block_tx,
     );
+
+    run_block_handler(server_state.clone(), block_rx);
+
     let loop_server_state = server_state.clone();
 
     let server_handle = tokio::spawn(async move {
@@ -191,7 +195,7 @@ async fn process(
         .master_state()
         .map(|ms| ms.replica_tx.subscribe());
 
-    let (mut stream_reader, mut stream_writer) = stream.into_split();
+    let (mut tcp_reader, mut tcp_writer) = stream.into_split();
     let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(100);
 
     let mut connection_state = ConnectionState::new(
@@ -205,11 +209,11 @@ async fn process(
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = stream_rx.recv().await {
-            if let Err(e) = stream_writer.write_all(&msg).await {
+            if let Err(e) = tcp_writer.write_all(&msg).await {
                 println!("Stream write error: {e}");
                 break;
             }
-            if let Err(e) = stream_writer.flush().await {
+            if let Err(e) = tcp_writer.flush().await {
                 println!("Stream flush error: {e}");
                 break;
             }
@@ -218,7 +222,7 @@ async fn process(
 
     loop {
         tokio::select! {
-            input_len = stream_reader.read_buf(&mut buf) => {
+            input_len = tcp_reader.read_buf(&mut buf) => {
                 match input_len {
                     Ok(0) => break,
                     Ok(_) => {
@@ -346,7 +350,8 @@ pub async fn execute_command(
     connection_state: ConnectionState,
 ) -> anyhow::Result<Vec<Bytes>> {
     let command = v[0].to_ascii_uppercase();
-    let _ = server_state.transaction_lock.read().await;
+    let server_state_clone = server_state.clone();
+    let _tlock = server_state_clone.transaction_lock.read().await;
 
     if let Some(handler) = REGISTRY.get(command.as_str()) {
         handler

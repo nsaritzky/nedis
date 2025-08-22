@@ -9,7 +9,7 @@ use crate::{
     replication::{PSyncHandler, ReplConfHandler, WaitHandler},
     set::{SADDHandler, SCARDHandler, SINTERHandler, SISMEMBERHandler, SREMHandler},
     simple_handlers::{
-        ConfigHandler, ConstantHandler, EchoHandler, EmptyHandler, EmptyRDBHandler, GetHandler,
+        ConfigHandler, ConstantHandler, EchoHandler, EmptyRDBHandler, GetHandler,
         InfoHandler, KeysHandler, PingHandler, SetHandler, TypeHandler,
     },
     sorted_set::{

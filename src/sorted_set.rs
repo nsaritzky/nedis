@@ -1,7 +1,6 @@
 use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::select_all::Iter;
 
 use crate::{
     command_handler::CommandHandler,
@@ -13,7 +12,7 @@ use crate::{
     state::{ConnectionState, ServerState},
 };
 
-use std::{borrow::Borrow, collections::HashMap, fmt::Debug, hash::Hash};
+use std::{collections::HashMap, fmt::Debug, hash::Hash};
 
 #[derive(Clone, Debug, Copy, PartialEq, PartialOrd)]
 pub struct OrdFloat(f64);

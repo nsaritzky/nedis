@@ -13,7 +13,9 @@ use std::{
 };
 
 use futures::future::join_all;
-use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{
+    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard
+};
 
 #[derive(Debug, Clone)]
 pub struct ShardMap<K, V> {
@@ -234,7 +236,7 @@ where
         f(&results)
     }
 
-    pub async fn get<Q>(&self, key: &Q) -> Option<RwLockReadGuard<V>>
+    pub async fn get<'a, Q>(&'_ self, key: &Q) -> Option<RwLockReadGuard<'_, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -243,16 +245,16 @@ where
         RwLockReadGuard::try_map(guard, |m| m.get(key)).ok()
     }
 
-    pub async fn get_mut<Q>(&mut self, key: &Q) -> Option<RwLockMappedWriteGuard<V>>
+    pub async fn get_mut<Q>(&mut self, key: &Q) -> Option<OwnedRwLockMappedWriteGuard<HashMap<K, V>, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         let guard = self.get_bucket_mut(key).await;
-        RwLockWriteGuard::try_map(guard, |m| m.get_mut(key)).ok()
+        OwnedRwLockWriteGuard::try_map(guard, |m| m.get_mut(key)).ok()
     }
 
-    pub async fn get_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<RwLockReadGuard<V>>
+    pub async fn get_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<OwnedRwLockReadGuard<HashMap<K, V>, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -265,14 +267,14 @@ where
                 None
             } else {
                 let read_guard = guard.downgrade();
-                Some(RwLockReadGuard::map(read_guard, |g| g.get(key).unwrap()))
+                Some(OwnedRwLockReadGuard::map(read_guard, |g| g.get(key).unwrap()))
             }
         } else {
             None
         }
     }
 
-    pub async fn get_mut_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<RwLockMappedWriteGuard<V>>
+    pub async fn get_mut_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<OwnedRwLockMappedWriteGuard<HashMap<K, V>, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -284,7 +286,7 @@ where
                 guard.remove(key);
                 None
             } else {
-                Some(RwLockWriteGuard::map(guard, |g| g.get_mut(key).unwrap()))
+                Some(OwnedRwLockWriteGuard::map(guard, |g| g.get_mut(key).unwrap()))
             }
         } else {
             None
@@ -357,13 +359,13 @@ where
         self.maps[index].read().await
     }
 
-    async fn get_bucket_mut<Q>(&self, k: &Q) -> RwLockWriteGuard<HashMap<K, V>>
+    async fn get_bucket_mut<Q>(&self, k: &Q) -> OwnedRwLockWriteGuard<HashMap<K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let index = Self::get_index_for_key(self.shard_count as u64, k);
-        self.maps[index].write().await
+        self.maps[index].clone().write_owned().await
     }
 
     fn get_index_for_key<Q>(shard_count: u64, k: &Q) -> usize
@@ -382,7 +384,7 @@ impl<K, V> ShardMap<K, V>
 where
     K: Eq + Hash + Clone,
 {
-    pub async fn entry<'a>(&'a mut self, key: K) -> ShardMapEntry<'a, K, V> {
+    pub async fn entry<'a>(&'a mut self, key: K) -> ShardMapEntry<K, V> {
         let guard = self.get_bucket_mut(&key).await;
         ShardMapEntry::new(guard, self.size.clone(), key)
     }
@@ -426,17 +428,17 @@ where
     }
 }
 
-pub enum ShardMapEntry<'a, K, V> {
-    Occupied(OccupiedShardMapEntry<'a, K, V>),
-    Vacant(VacantShardMapEntry<'a, K, V>),
+pub enum ShardMapEntry<K, V> {
+    Occupied(OccupiedShardMapEntry<K, V>),
+    Vacant(VacantShardMapEntry<K, V>),
 }
 
-impl<'a, K, V> ShardMapEntry<'a, K, V>
+impl<K, V> ShardMapEntry<K, V>
 where
     K: Eq + Hash + Clone,
 {
     pub fn new(
-        guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+        guard: OwnedRwLockWriteGuard<HashMap<K, V>>,
         shard_map_size: Arc<AtomicUsize>,
         key: K,
     ) -> Self {
@@ -451,6 +453,15 @@ where
         match self {
             Self::Occupied(occ) => Some(occ.get()),
             Self::Vacant(_) => None,
+        }
+    }
+
+    pub fn guard(self) -> OwnedRwLockMappedWriteGuard<HashMap<K, V>, V> {
+        match self {
+            Self::Occupied(occ) => occ.guard(),
+            Self::Vacant(vac) => {
+                OwnedRwLockWriteGuard::map(vac.guard, |g| g.get_mut(&vac.key).unwrap())
+            }
         }
     }
 
@@ -474,25 +485,28 @@ where
         }
     }
 
-    pub fn or_insert<F>(self, default: V) {
-        if let Self::Vacant(entry) = self {
-            entry.insert(default);
+    pub fn or_insert(self, default: V) -> OwnedRwLockMappedWriteGuard<HashMap<K, V>, V> {
+        match self {
+            Self::Vacant(vac) => vac.insert(default),
+            Self::Occupied(occ) => {
+                OwnedRwLockWriteGuard::map(occ.guard, |g| g.get_mut(&occ.key).unwrap())
+            }
         }
     }
 }
 
-pub struct OccupiedShardMapEntry<'a, K, V> {
-    guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+pub struct OccupiedShardMapEntry<K, V> {
+    guard: OwnedRwLockWriteGuard<HashMap<K, V>>,
     shard_map_size: Arc<AtomicUsize>,
     key: K,
 }
 
-impl<'a, K, V> OccupiedShardMapEntry<'a, K, V>
+impl<K, V> OccupiedShardMapEntry<K, V>
 where
     K: Eq + Hash + Clone,
 {
     fn new(
-        guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+        guard: OwnedRwLockWriteGuard<HashMap<K, V>>,
         shard_map_size: Arc<AtomicUsize>,
         key: K,
     ) -> Self {
@@ -509,6 +523,10 @@ where
 
     pub fn get_mut(&mut self) -> &mut V {
         self.guard.get_mut(&self.key).unwrap()
+    }
+
+    pub fn guard(self) -> OwnedRwLockMappedWriteGuard<HashMap<K, V>, V> {
+        OwnedRwLockWriteGuard::map(self.guard, |g| g.get_mut(&self.key).unwrap())
     }
 
     pub fn insert(&mut self, value: V) -> V {
@@ -540,22 +558,23 @@ where
     }
 }
 
-pub struct VacantShardMapEntry<'a, K, V> {
-    guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+pub struct VacantShardMapEntry<K, V> {
+    guard: OwnedRwLockWriteGuard<HashMap<K, V>>,
     shard_map_size: Arc<AtomicUsize>,
     key: K,
 }
 
-impl<'a, K, V> VacantShardMapEntry<'a, K, V>
+impl<K, V> VacantShardMapEntry<K, V>
 where
     K: Eq + Hash + Clone,
 {
-    pub fn insert(mut self, value: V) {
-        self.guard.insert(self.key, value);
+    pub fn insert(mut self, value: V) -> OwnedRwLockMappedWriteGuard<HashMap<K, V>, V> {
+        self.guard.insert(self.key.clone(), value);
+        OwnedRwLockWriteGuard::map(self.guard, |g| g.get_mut(&self.key).unwrap())
     }
 
     fn new(
-        guard: RwLockWriteGuard<'a, HashMap<K, V>>,
+        guard: OwnedRwLockWriteGuard<HashMap<K, V>>,
         shard_map_size: Arc<AtomicUsize>,
         key: K,
     ) -> Self

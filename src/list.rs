@@ -1,14 +1,16 @@
-use std::{
-    collections::{hash_map::Entry, BTreeSet, VecDeque},
-    time::{Duration, SystemTime},
-};
+use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::{task, time::interval};
+use futures::future;
+use tokio::{
+    sync::oneshot,
+    time::{sleep_until, Instant},
+};
 
 use crate::{
+    blocking::BlockMsg,
     command_handler::CommandHandler,
     db_item::DbItem,
     db_value::DbValue,
@@ -34,30 +36,32 @@ impl CommandHandler for RPushHandler {
         };
 
         if let Some(key) = key {
-            let size_res = server_state
-                .db
-                .with_entry(key, |entry| match entry {
-                    Entry::Occupied(mut occ) => {
-                        let item = occ.get_mut();
-                        item.update_with(|value| {
-                            if let DbValue::List(ref mut array) = value {
-                                array.append(&mut values.into());
-                                Ok(array.len())
-                            } else {
-                                bail!("RPUSH: Value at key is not a list")
-                            }
-                        })
+            let (mut item, size) = match server_state.db.entry(key.clone()).await {
+                ShardMapEntry::Occupied(mut occ) => {
+                    let value = occ.get_mut().value_mut();
+                    if let DbValue::List(list) = value {
+                        list.append(&mut values.into());
+                        let size = list.len();
+                        (occ.guard(), size)
+                    } else {
+                        bail!("RPUSH: Value at key is not a list")
                     }
-                    Entry::Vacant(vac) => {
-                        let size = values.len();
-                        let new_item = DbItem::new(DbValue::List(values.into()), None);
-                        vac.insert(new_item);
-                        Ok(size)
-                    }
-                })
-                .await;
+                }
+                ShardMapEntry::Vacant(vac) => {
+                    let size = values.len();
+                    (
+                        vac.insert(DbItem::new(DbValue::List(values.into()), None)),
+                        size,
+                    )
+                }
+            };
 
-            size_res.map(|n| vec![RedisResponse::Int(n as isize).to_bytes()])
+            item.update_timestamp();
+
+            let msg = BlockMsg::BlPopUnblock(key.clone(), item);
+            server_state.block_tx.send(msg).await?;
+
+            Ok(vec![RedisResponse::Int(size as isize).to_bytes()])
         } else {
             bail!("Bad key: {key:?}");
         }
@@ -142,46 +146,43 @@ impl CommandHandler for LPushHandler {
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
-        if args.len() < 3 {
-            bail!("LPUSH: Not enough arguments");
-        }
-        let key = args.remove(1);
-        let values: Vec<_> = args.drain(1..).collect();
-
-        if values.len() == 0 {
-            return Ok(vec![":0\r\n".into()]);
-        }
-
-        let entry = server_state.db.entry(key).await;
-
-        let size = match entry {
-            ShardMapEntry::Occupied(mut occ) => {
-                let item = occ.get_mut();
-                item.update_timestamp();
-                let value = item.value_mut();
-
-                if let DbValue::List(ref mut array) = value {
-                    for s in values {
-                        array.push_front(s.into())
-                    }
-                    array.len()
-                } else {
-                    bail!("LPUSH: Value is not a list")
-                }
-            }
-            ShardMapEntry::Vacant(vac) => {
-                let size = values.len();
-                let new_item = DbItem::new(
-                    DbValue::List(values.into_iter().rev().map(|s| s.into()).collect()),
-                    None,
-                );
-                vac.insert(new_item);
-                size
-            }
+        let (key, values) = {
+            let mut drain = args.drain(1..);
+            (drain.next(), drain.collect::<Vec<_>>())
         };
 
-        let resp = RedisResponse::Int(size as isize);
-        Ok(vec![resp.to_bytes()])
+        if let Some(key) = key {
+            let (mut item, size) = match server_state.db.entry(key.clone()).await {
+                ShardMapEntry::Occupied(mut occ) => {
+                    let value = occ.get_mut().value_mut();
+                    if let DbValue::List(list) = value {
+                        for v in values {
+                            list.push_front(v);
+                        }
+                        let size = list.len();
+                        (occ.guard(), size)
+                    } else {
+                        bail!("LPUSH: Value at key is not a list")
+                    }
+                }
+                ShardMapEntry::Vacant(vac) => {
+                    let size = values.len();
+                    (
+                        vac.insert(DbItem::new(DbValue::List(values.into()), None)),
+                        size,
+                    )
+                }
+            };
+
+            item.update_timestamp();
+
+            let msg = BlockMsg::BlPopUnblock(key.clone(), item);
+            server_state.block_tx.send(msg).await?;
+
+            Ok(vec![RedisResponse::Int(size as isize).to_bytes()])
+        } else {
+            bail!("Bad key: {key:?}");
+        }
     }
 }
 
@@ -266,17 +267,17 @@ impl CommandHandler for BLPopHandler {
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> anyhow::Result<Vec<Bytes>> {
-        let mut interval = interval(Duration::from_millis(10));
         let key = &args[1];
-        {
-            let mut blocks = server_state.blocks.lock().await;
 
-            if let Some(blocks_set) = blocks.get_mut(key) {
-                blocks_set.insert((SystemTime::now(), task::id().to_string()));
+        if let Some(mut item) = server_state.db.get_mut(key).await {
+            if let DbValue::List(list) = item.value_mut() {
+                if let Some(result) = list.pop_front() {
+                    item.update_timestamp();
+                    let resp: RedisResponse = vec![key.clone(), result].into_iter().collect();
+                    return Ok(vec![resp.to_bytes()]);
+                }
             } else {
-                let mut blocks_set: BTreeSet<(SystemTime, String)> = BTreeSet::new();
-                blocks_set.insert((SystemTime::now(), task::id().to_string()));
-                blocks.insert(key.clone(), blocks_set);
+                bail!("BLPOP: Value at key is not a list")
             }
         }
 
@@ -284,58 +285,32 @@ impl CommandHandler for BLPopHandler {
             if t == "0" {
                 None
             } else {
-                let current_time = SystemTime::now();
+                let current_time = Instant::now();
                 current_time.checked_add(Duration::from_secs_f64(t.parse().unwrap()))
             }
         } else {
             None
         };
 
-        loop {
-            interval.tick().await;
+        let (return_tx, return_rx) = oneshot::channel();
+        let msg = BlockMsg::BlPop(key.clone(), expires, return_tx);
 
-            if let Some(expires) = expires {
-                if expires < SystemTime::now() {
-                    let mut blocks = server_state.blocks.lock().await;
-                    let blocks_set = blocks.get_mut(key).expect("Blocks set should exist.");
-                    blocks_set.retain(|(_, id)| *id != task::id().to_string());
-                    if blocks_set.is_empty() {
-                        blocks.remove(key);
-                    }
-                    return Ok(vec!["$-1\r\n".into()]);
-                }
-            }
+        server_state.block_tx.send(msg).await?;
 
-            if let Some(mut item) = server_state.db.get_mut(key).await {
-                let value = item.value_mut();
-                if let DbValue::List(ref mut array) = value {
-                    if !array.is_empty() {
-                        let mut blocks = server_state.blocks.lock().await;
-                        if let Some(blocks_set) = blocks.get_mut(key) {
-                            if let Some((_, first_id)) = blocks_set.first() {
-                                if *first_id == task::id().to_string() {
-                                    let value = array.pop_front().unwrap();
-                                    blocks_set.pop_first();
-
-                                    if blocks_set.is_empty() {
-                                        blocks.remove(key);
-                                    }
-
-                                    let resp_vec = vec![
-                                        RedisResponse::Str(key.clone()),
-                                        RedisResponse::Str(value),
-                                    ];
-
-                                    let resp = RedisResponse::List(resp_vec).to_bytes();
-
-                                    item.update_timestamp();
-                                    return Ok(vec![resp]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        tokio::select! {
+            result = return_rx => result.and_then(|value| {
+                    let resp: RedisResponse = vec![key.clone(), value].into_iter().collect();
+                    Ok(vec![resp.to_bytes()])
+                }).map_err(|_| anyhow!("BLPOP: Failed to receive return value from blocking handler")),
+            _ = sleep_until_if(expires) => Ok(vec!["$-1\r\n".into()])
         }
+    }
+}
+
+async fn sleep_until_if(until: Option<Instant>) {
+    if let Some(instant) = until {
+        sleep_until(instant).await
+    } else {
+        future::pending::<()>().await
     }
 }

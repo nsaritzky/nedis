@@ -50,4 +50,8 @@ impl DbItem {
     pub fn value_mut(&mut self) -> &mut DbValue {
         &mut self.value
     }
+
+    pub fn destruct(self) -> (DbValue, Option<SystemTime>) {
+        (self.value, self.expires)
+    }
 }

@@ -11,7 +11,7 @@ use winnow::{
     Parser, Result,
 };
 
-use crate::{db_item::DbItem, db_value::DbValue};
+use crate::db_item::DbItem;
 
 const HEADER_STRING: [u8; 9] = *b"REDIS0011";
 const METADATA_HEADER: u8 = 0xFA;

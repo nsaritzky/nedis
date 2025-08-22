@@ -15,7 +15,7 @@ use futures::future::join_all;
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
 use crate::{
-    db::Db, db_item::DbItem, db_value::DbValue, replica_tracker::ReplicaTracker, shard_map::ShardMap
+    blocking::BlockMsg, db::Db, db_item::DbItem, replica_tracker::ReplicaTracker, shard_map::ShardMap
 };
 
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
@@ -31,6 +31,7 @@ pub struct ServerState {
     subscriptions: Subscriptions,
     next_connection_id: Arc<AtomicUsize>,
     pub transaction_lock: Arc<RwLock<()>>,
+    pub block_tx: mpsc::Sender<BlockMsg>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,7 @@ impl ServerState {
         is_master: bool,
         replica_tx: Option<broadcast::Sender<Bytes>>,
         db: Option<HashMap<String, DbItem>>,
+        block_tx: mpsc::Sender<BlockMsg>,
     ) -> Self {
         ServerState {
             state: if is_master {
@@ -67,6 +69,7 @@ impl ServerState {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
             transaction_lock: Arc::new(RwLock::new(())),
+            block_tx
         }
     }
 

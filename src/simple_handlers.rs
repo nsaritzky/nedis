@@ -9,7 +9,6 @@ use crate::{
     db_item::DbItem,
     db_value::DbValue,
     response::RedisResponse,
-    shard_map::ShardMapEntry,
     state::{ConnectionState, ServerState},
     utils::bulk_string,
     GLOBAL_CONFIG,
