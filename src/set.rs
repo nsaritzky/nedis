@@ -1,16 +1,10 @@
 use std::collections::HashSet;
 
-use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::{
-    command_handler::CommandHandler,
-    db_item::DbItem,
-    db_value::DbValue,
-    response::RedisResponse,
-    shard_map::ShardMapEntry,
-    state::{ConnectionState, ServerState},
+    command_handler::CommandHandler, db_item::DbItem, db_value::DbValue, error::RedisError, response::Response, shard_map::ShardMapEntry, state::{ConnectionState, ServerState}
 };
 
 pub struct SADDHandler;
@@ -22,9 +16,9 @@ impl CommandHandler for SADDHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() <= 3 {
-            bail!("SADD: Not enough arguments")
+            return Err(RedisError::WrongArgs("SADD"));
         }
         let mut drain = args.drain(1..);
         let key = drain.next().unwrap();
@@ -43,7 +37,7 @@ impl CommandHandler for SADDHandler {
                     }
                     size = set.len()
                 } else {
-                    bail!("SADD: Value at key is not a set")
+                    return Err(RedisError::WrongType);
                 }
                 if update_flag {
                     item.update_timestamp();
@@ -58,7 +52,7 @@ impl CommandHandler for SADDHandler {
             }
         };
 
-        let resp = RedisResponse::Int(size as isize);
+        let resp = Response::Int(size as isize);
         Ok(vec![resp.to_bytes()])
     }
 }
@@ -72,9 +66,9 @@ impl CommandHandler for SREMHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() <= 3 {
-            bail!("SREM: Not enough arguments")
+            return Err(RedisError::WrongArgs("SREM"));
         }
         let mut drain = args.drain(1..);
         let key = drain.next().unwrap();
@@ -87,7 +81,7 @@ impl CommandHandler for SREMHandler {
                 if let DbValue::Set(ref mut set) = item.value_mut() {
                     result = set.extract_if(|item| members.contains(item)).count()
                 } else {
-                    bail!("SREM: Value at key is not a set")
+                    return Err(RedisError::WrongType);
                 }
                 if result > 0 {
                     item.update_timestamp();
@@ -96,7 +90,7 @@ impl CommandHandler for SREMHandler {
             ShardMapEntry::Vacant(_) => result = 0,
         };
 
-        let resp = RedisResponse::Int(result as isize);
+        let resp = Response::Int(result as isize);
         Ok(vec![resp.to_bytes()])
     }
 }
@@ -110,14 +104,14 @@ impl CommandHandler for SISMEMBERHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         let [_, key, entry] = <[String; 3]>::try_from(args)
-            .map_err(|_| anyhow!("SISMEMBER: Wrong number of args"))?;
+            .map_err(|_| RedisError::WrongArgs("SISMEMBER"))?;
 
         let value = server_state.db.get(&key).await;
         let result = match value.as_deref() {
             Some(DbValue::Set(set)) => set.contains(&entry),
-            Some(_) => bail!("SISMEMBER: Value at key is not a set"),
+            Some(_) => return Err(RedisError::WrongType),
             None => false,
         };
         if result {
@@ -137,12 +131,12 @@ impl CommandHandler for SINTERHandler {
         server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 3 {
-            bail!("SINTER: Wrong number of args")
+            return Err(RedisError::WrongArgs("SINTER"))
         }
         let [_, key1, key2] =
-            <[String; 3]>::try_from(args).map_err(|_| anyhow!("SINTER: Wrong number of args"))?;
+            <[String; 3]>::try_from(args).unwrap();
 
         let result = server_state.db.with_values(&[key1.clone(), key2.clone()], |values| {
             let item1 = values[0];
@@ -157,13 +151,11 @@ impl CommandHandler for SINTERHandler {
                 (Some(DbValue::Set(_)), None) | (None, Some(DbValue::Set(_))) | (None, None) => {
                     Ok(vec![])
                 }
-                (Some(_), Some(_)) => bail!("SINTER: Values at keys are not sets"),
-                (Some(_), None) => bail!("SINTER: Value at key {key1} is not a set"),
-                (None, Some(_)) => bail!("SINTER: Value at key {key2} is not a set"),
+                (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => return Err(RedisError::WrongType),
             }
         }).await?;
 
-        let resp: RedisResponse = result.into_iter().collect();
+        let resp: Response = result.into_iter().collect();
 
         Ok(vec![resp.to_bytes()])
     }
@@ -178,19 +170,18 @@ impl CommandHandler for SCARDHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
-        if let Some(key) = args.get(1) {
-            let value = server_state.db.get(key).await;
-
-            let result = match value.as_deref() {
-                Some(DbValue::Set(set)) => set.len(),
-                Some(_) => bail!("SCARD: Value at key is not a set"),
-                None => 0,
-            };
-
-            Ok(vec![RedisResponse::Int(result as isize).to_bytes()])
-        } else {
-            bail!("SCARD: No key provided")
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() != 2 {
+            return Err(RedisError::WrongArgs("SCARD"));
         }
+        let value = server_state.db.get(&args[1]).await;
+
+        let result = match value.as_deref() {
+            Some(DbValue::Set(set)) => set.len(),
+            Some(_) => return Err(RedisError::WrongType),
+            None => 0,
+        };
+
+        Ok(vec![Response::Int(result as isize).to_bytes()])
     }
 }

@@ -1,15 +1,11 @@
 use std::time::{Duration, SystemTime};
 
-use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::time::interval;
 
 use crate::{
-    command_handler::CommandHandler,
-    response::RedisResponse,
-    state::{ConnectionState, ConnectionType, ServerState},
-    EMPTY_RDB_BYTES, GLOBAL_CONFIG,
+    command_handler::CommandHandler, error::RedisError, response::Response, state::{ConnectionState, ConnectionType, ServerState}, EMPTY_RDB_BYTES, GLOBAL_CONFIG
 };
 
 pub struct PSyncHandler;
@@ -21,7 +17,7 @@ impl CommandHandler for PSyncHandler {
         server_state: ServerState,
         mut connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if let Some(master_state) = server_state.clone().master_state() {
             let global_config = GLOBAL_CONFIG.get().unwrap();
             let master_config = global_config.get_master_config().unwrap();
@@ -34,7 +30,7 @@ impl CommandHandler for PSyncHandler {
                 EMPTY_RDB_BYTES.clone(),
             ])
         } else {
-            bail!("Tried to call PSYNC on a replica")
+            Err(RedisError::CommandNotAllowed("PSYNC"))
         }
     }
 }
@@ -48,15 +44,15 @@ impl CommandHandler for ReplConfHandler {
         mut server_state: ServerState,
         connection_state: ConnectionState,
         message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if let Some(s) = args.get(1) {
             match s.to_ascii_uppercase().as_str() {
                 "GETACK" => {
                     let offset = server_state.load_offset() - message_len;
-                    let resp = RedisResponse::List(vec![
-                        RedisResponse::Str("REPLCONF".to_string()),
-                        RedisResponse::Str("ACK".to_string()),
-                        RedisResponse::Str(offset.to_string()),
+                    let resp = Response::List(vec![
+                        Response::Str("REPLCONF".to_string()),
+                        Response::Str("ACK".to_string()),
+                        Response::Str(offset.to_string()),
                     ]);
                     Ok(vec![resp.to_bytes()])
                 }
@@ -71,16 +67,16 @@ impl CommandHandler for ReplConfHandler {
                             master_state.update_offset_tracker(replica_id, offset).await;
                             Ok(vec![])
                         } else {
-                            bail!("ACK: ack was sent, but not from a replica")
+                            return Err(RedisError::CommandNotAllowed("REPLCONF"));
                         }
                     } else {
-                        bail!("ACK: ack was sent, but not to a master")
+                        return Err(RedisError::CommandNotAllowed("REPLCONF"));
                     }
                 }
-                _ => Ok(vec!["+OK\r\n".into()]),
+                _ => Ok(vec![Response::Ok.to_bytes()]),
             }
         } else {
-            Ok(vec!["+OK\r\n".into()])
+            Ok(vec![Response::Ok.to_bytes()])
         }
     }
 }
@@ -94,20 +90,20 @@ impl CommandHandler for WaitHandler {
         server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() != 3 {
+            return Err(RedisError::WrongArgs("WAIT"));
+        }
         if let Some(master_state) = server_state.clone().master_state() {
             let GETACK_MSG_LEN = 37;
-            let n = args
-                .get(1)
-                .and_then(|s| s.parse::<usize>().ok())
-                .expect("WAIT: Invalid replica count");
-            let timeout = args
-                .get(2)
-                .and_then(|s| s.parse::<u64>().ok())
-                .expect("WAIT: Invalid timeout");
+            let n = args[1].parse::<usize>().map_err(|_| RedisError::InvalidTimeout)?;
+            let timeout = args[2].parse::<i64>().map_err(|_| RedisError::InvalidTimeout)?;
+            if timeout < 0 {
+                return Err(RedisError::NegativeTimeout);
+            }
 
             let expires = SystemTime::now()
-                .checked_add(Duration::from_millis(timeout))
+                .checked_add(Duration::from_millis(timeout as u64))
                 .expect("WAIT: Invalid expiration");
 
             let mut interval = interval(Duration::from_millis(10));
@@ -137,6 +133,6 @@ impl CommandHandler for WaitHandler {
                 }
             }
         }
-        bail!("Called WAIT on a replica");
+        Err(RedisError::CommandNotAllowed("WAIT"))
     }
 }

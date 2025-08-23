@@ -2,19 +2,21 @@ use bytes::{Bytes, BytesMut};
 
 use crate::db_value::{DbValue, StreamElement};
 
-pub enum RedisResponse {
+pub enum Response {
     Str(String),
     Int(isize),
-    List(Vec<RedisResponse>),
+    List(Vec<Response>),
     Nil,
+    Empty,
+    Ok,
 }
 
-impl RedisResponse {
+impl Response {
     pub fn to_bytes(&self) -> Bytes {
         match self {
-            RedisResponse::Str(s) => format!("${}\r\n{s}\r\n", s.len()).into(),
-            RedisResponse::Int(n) => format!(":{n}\r\n").into(),
-            RedisResponse::List(array) => {
+            Response::Str(s) => format!("${}\r\n{s}\r\n", s.len()).into(),
+            Response::Int(n) => format!(":{n}\r\n").into(),
+            Response::List(array) => {
                 let mut buf = BytesMut::new();
                 buf.extend_from_slice(format!("*{}\r\n", array.len()).as_bytes());
                 for val in array {
@@ -22,23 +24,25 @@ impl RedisResponse {
                 }
                 buf.freeze()
             }
-            RedisResponse::Nil => "$-1\r\n".into(),
+            Response::Nil => "$-1\r\n".into(),
+            Response::Empty => "*0\r\n".into(),
+            Response::Ok => "+OK\r\n".into(),
         }
     }
 
     pub fn from_str_vec(v: &Vec<String>) -> Self {
-        RedisResponse::List(v.iter().map(|s| RedisResponse::Str(s.clone())).collect())
+        Response::List(v.iter().map(|s| Response::Str(s.clone())).collect())
     }
 
     pub fn from_stream(key: String, value: Vec<&StreamElement>) -> Self {
-        RedisResponse::List(vec![
+        Response::List(vec![
             key.into(),
             value
                 .into_iter()
                 .map(|element| {
-                    RedisResponse::List(vec![
-                        RedisResponse::Str(element.id.clone()),
-                        RedisResponse::List(
+                    Response::List(vec![
+                        Response::Str(element.id.clone()),
+                        Response::List(
                             element
                                 .value
                                 .iter()
@@ -52,41 +56,41 @@ impl RedisResponse {
     }
 }
 
-impl FromIterator<RedisResponse> for RedisResponse {
-    fn from_iter<T: IntoIterator<Item = RedisResponse>>(iter: T) -> Self {
-        RedisResponse::List(iter.into_iter().collect())
+impl FromIterator<Response> for Response {
+    fn from_iter<T: IntoIterator<Item = Response>>(iter: T) -> Self {
+        Response::List(iter.into_iter().collect())
     }
 }
 
-impl<'a> FromIterator<&'a String> for RedisResponse {
+impl<'a> FromIterator<&'a String> for Response {
     fn from_iter<T: IntoIterator<Item = &'a String>>(iter: T) -> Self {
-        RedisResponse::List(
+        Response::List(
             iter.into_iter()
-                .map(|s| RedisResponse::Str(s.to_string()))
+                .map(|s| Response::Str(s.to_string()))
                 .collect(),
         )
     }
 }
 
-impl FromIterator<String> for RedisResponse {
+impl FromIterator<String> for Response {
     fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
-        RedisResponse::List(iter.into_iter().map(|s| s.into()).collect())
+        Response::List(iter.into_iter().map(|s| s.into()).collect())
     }
 }
 
-impl From<&DbValue> for RedisResponse {
+impl From<&DbValue> for Response {
     fn from(value: &DbValue) -> Self {
         match value {
-            DbValue::String(s) => RedisResponse::Str(s.clone()),
+            DbValue::String(s) => Response::Str(s.clone()),
             DbValue::List(arr) => {
-                RedisResponse::from_str_vec(&arr.iter().map(|s| s.clone()).collect())
+                Response::from_str_vec(&arr.iter().map(|s| s.clone()).collect())
             }
-            DbValue::Stream(arr) => RedisResponse::List(
+            DbValue::Stream(arr) => Response::List(
                 arr.iter()
                     .map(|elt| {
-                        RedisResponse::List(vec![
-                            RedisResponse::Str(elt.id.clone()),
-                            RedisResponse::List(
+                        Response::List(vec![
+                            Response::Str(elt.id.clone()),
+                            Response::List(
                                 elt.value
                                     .iter()
                                     .flat_map(|(k, v)| [k.clone().into(), v.clone().into()])
@@ -96,27 +100,27 @@ impl From<&DbValue> for RedisResponse {
                     })
                     .collect(),
             ),
-            DbValue::Hash(map) => RedisResponse::List(
+            DbValue::Hash(map) => Response::List(
                 map.iter()
                     .flat_map(|(k, v)| [k.clone().into(), v.clone().into()])
                     .collect(),
             ),
             DbValue::Set(set) => set.iter().collect(),
-            DbValue::ZSet(set) => unimplemented!(),
-            DbValue::Empty => RedisResponse::Nil,
+            DbValue::ZSet(zset) => zset.iter().collect(),
+            DbValue::Empty => Response::Nil,
         }
     }
 }
 
-impl From<Vec<&StreamElement>> for RedisResponse {
+impl From<Vec<&StreamElement>> for Response {
     fn from(value: Vec<&StreamElement>) -> Self {
-        RedisResponse::List(
+        Response::List(
             value
                 .into_iter()
                 .map(|element| {
-                    RedisResponse::List(vec![
-                        RedisResponse::Str(element.id.clone()),
-                        RedisResponse::List(
+                    Response::List(vec![
+                        Response::Str(element.id.clone()),
+                        Response::List(
                             element
                                 .value
                                 .iter()
@@ -130,20 +134,20 @@ impl From<Vec<&StreamElement>> for RedisResponse {
     }
 }
 
-impl From<String> for RedisResponse {
+impl From<String> for Response {
     fn from(value: String) -> Self {
-        RedisResponse::Str(value)
+        Response::Str(value)
     }
 }
 
-impl From<&str> for RedisResponse {
+impl From<&str> for Response {
     fn from(value: &str) -> Self {
-        RedisResponse::Str(value.to_string())
+        Response::Str(value.to_string())
     }
 }
 
-impl From<isize> for RedisResponse {
+impl From<isize> for Response {
     fn from(value: isize) -> Self {
-        RedisResponse::Int(value)
+        Response::Int(value)
     }
 }

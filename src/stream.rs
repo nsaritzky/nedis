@@ -1,6 +1,5 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -13,7 +12,8 @@ use crate::{
     command_handler::CommandHandler,
     db_item::DbItem,
     db_value::{DbValue, StreamElement},
-    response::RedisResponse,
+    error::RedisError,
+    response::Response,
     state::{ConnectionState, ServerState},
 };
 
@@ -26,51 +26,37 @@ impl CommandHandler for XADDHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
-        if let Some(key) = args.get(1) {
-            server_state.db.with_entry(key.clone(), |entry| {
-
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() < 5 {
+            return Err(RedisError::WrongArgs("XADD"));
+        }
+        let key = &args[1];
+        server_state
+            .db
+            .with_entry(key.clone(), |entry| {
                 let item = entry.or_insert(DbItem::new(DbValue::Stream(vec![]), None));
 
                 let result;
                 if let DbValue::Stream(ref mut stream_vec) = item.value_mut() {
-                    if let Some(id) = args.get(2) {
-                        let id = match generate_and_validate_stream_id(&stream_vec[..], id) {
-                            Ok(id) => id,
-                            Err(StreamIdValidationError::Zero) => {
-                                return Ok(vec![
-                                    "-ERR The ID specified in XADD must be greater than 0-0\r\n".into(),
-                                ]);
-                            }
-                            Err(StreamIdValidationError::DecreasingTimestamp)
-                                | Err(StreamIdValidationError::NonincreasingSequence) => {
-                                    return Ok(vec!["-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".into()]);
-                                }
-                            Err(e) => bail!(e),
-                        };
+                    let id = generate_and_validate_stream_id(&stream_vec[..], &args[2])?;
 
-                        let mut map = IndexMap::new();
+                    let mut map = IndexMap::new();
 
-                        for (stream_key, value) in args.drain(3..).tuples() {
-                            map.insert(stream_key, value);
-                        }
-
-                        let new_stream_element = StreamElement::new(id.clone(), map);
-                        stream_vec.push(new_stream_element);
-
-                        result = Ok(vec![RedisResponse::Str(id).to_bytes()]);
-                    } else {
-                        bail!("Could not get id");
+                    for (stream_key, value) in args.drain(3..).tuples() {
+                        map.insert(stream_key, value);
                     }
+
+                    let new_stream_element = StreamElement::new(id.clone(), map);
+                    stream_vec.push(new_stream_element);
+
+                    result = Ok(vec![Response::Str(id).to_bytes()]);
                 } else {
-                    bail!("XADD: Value at key is not a stream");
+                    result = Err(RedisError::WrongType);
                 }
                 item.update_timestamp();
                 result
-            }).await
-        } else {
-            bail!("Could not extract key");
-        }
+            })
+            .await
     }
 }
 
@@ -79,22 +65,18 @@ pub struct XRangeHandler;
 impl CommandHandler for XRangeHandler {
     async fn execute(
         &self,
-        mut args: Vec<String>,
+        args: Vec<String>,
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 4 {
-            bail!("XRANGE: Wrong number of arguments")
+            return Err(RedisError::WrongArgs("XRANGE"));
         }
-        if let Some(key) = args.get(1) {
-            let value = server_state.db.get(key).await;
-            match value.as_deref() {
-                Some(DbValue::Stream(stream_vec)) => {
-                let mut drain = args.drain(2..4);
-                let start = drain.next().unwrap();
-                let end = drain.next().unwrap();
-
+        let [_command, key, start, end] = args.try_into().unwrap();
+        let value = server_state.db.get(&key).await;
+        match value.as_deref() {
+            Some(DbValue::Stream(stream_vec)) => {
                 let (start_timestamp, start_sequence): (u128, usize) = {
                     if start == "-" {
                         (0, 0)
@@ -148,13 +130,10 @@ impl CommandHandler for XRangeHandler {
                         result_vec.push(value);
                     }
                 }
-                Ok(vec![RedisResponse::from(result_vec).to_bytes()])
-                }
-                Some(_) => bail!("XADD: Value at key is not a stream"),
-                None => Ok(vec![RedisResponse::List(vec![]).to_bytes()])
+                Ok(vec![Response::from(result_vec).to_bytes()])
             }
-        } else {
-            bail!("XADD: No key argument")
+            Some(_) => return Err(RedisError::WrongType),
+            None => Ok(vec![Response::Empty.to_bytes()]),
         }
     }
 }
@@ -168,14 +147,19 @@ impl CommandHandler for XReadHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() < 4 {
+            return Err(RedisError::WrongArgs("XREAD"));
+        }
         if let Some(arg) = args.get(1) {
             if arg.to_ascii_lowercase() == "block" {
                 let mut interval = interval(Duration::from_millis(10));
 
-                let timeout: u64 = args[2]
-                    .parse()
-                    .expect("Timeout arg should be an unsigned int");
+                let timeout: i64 = args[2].parse().map_err(|_| StreamError::InvalidTimeout)?;
+                if timeout < 0 {
+                    return Err(StreamError::NegativeTimeout.into());
+                }
+                let timeout = timeout as u64;
 
                 let expires = if timeout > 0 {
                     Some(
@@ -188,7 +172,7 @@ impl CommandHandler for XReadHandler {
                 };
 
                 if args[3].to_ascii_uppercase() != "STREAMS" {
-                    bail!("XREAD: STREAMS arg required")
+                    return Err(RedisError::Syntax);
                 }
 
                 let key = &args[4];
@@ -197,7 +181,7 @@ impl CommandHandler for XReadHandler {
                 let (start_timestamp, start_sequence) = {
                     let value = server_state.db.get(key).await;
                     let stream_vec = value.as_deref().and_then(|val| val.to_stream_vec());
-                    parse_id_with_dollar_sign(&start, stream_vec)
+                    parse_id_with_dollar_sign(&start, stream_vec)?
                 };
 
                 loop {
@@ -210,19 +194,19 @@ impl CommandHandler for XReadHandler {
                     let value = server_state.db.get(key).await;
                     if let Some(DbValue::Stream(stream_vec)) = value.as_deref() {
                         if let Some(last) = stream_vec.last() {
-                            let (timestamp, sequence) = parse_id(&last.id);
+                            let (timestamp, sequence) = parse_id(&last.id)?;
                             if timestamp > start_timestamp
                                 || (timestamp == start_timestamp && sequence > start_sequence)
                             {
                                 let mut j = 0usize;
 
-                                let (mut timestamp, mut sequence) = parse_id(&stream_vec[0].id);
+                                let (mut timestamp, mut sequence) = parse_id(&stream_vec[0].id)?;
                                 while timestamp < start_timestamp
                                     || (timestamp == start_timestamp && sequence <= start_sequence)
                                 {
                                     j += 1;
 
-                                    (timestamp, sequence) = parse_id(&stream_vec[j].id);
+                                    (timestamp, sequence) = parse_id(&stream_vec[j].id)?;
                                 }
 
                                 let result_vec = gather_stream_read_results(
@@ -230,9 +214,9 @@ impl CommandHandler for XReadHandler {
                                     start_timestamp,
                                     start_sequence,
                                     key.clone(),
-                                );
+                                )?;
 
-                                let resp_value = RedisResponse::List(vec![result_vec].into());
+                                let resp_value = Response::List(vec![result_vec].into());
 
                                 return Ok(vec![resp_value.to_bytes()]);
                             }
@@ -246,11 +230,11 @@ impl CommandHandler for XReadHandler {
             .get(1)
             .is_none_or(|s| s.to_ascii_uppercase() != "STREAMS")
         {
-            bail!("XREAD: STREAMS arg required")
+            return Err(RedisError::Syntax);
         }
 
         if args.len() % 2 != 0 {
-            bail!("XREAD: An even number of arguments after STREAMS arg is required")
+            return Err(RedisError::WrongArgs("XREAD"));
         }
 
         let (keys, starts) = args[2..].split_at((args.len() - 2) / 2);
@@ -259,7 +243,7 @@ impl CommandHandler for XReadHandler {
             .into_iter()
             .zip(starts)
             .map(|(k, start)| async {
-                let (start_timestamp, start_sequence) = parse_id(start);
+                let (start_timestamp, start_sequence) = parse_id(start)?;
                 gather_stream_read_results(
                     server_state
                         .clone()
@@ -269,7 +253,7 @@ impl CommandHandler for XReadHandler {
                         .as_deref()
                         .unwrap_or(&DbValue::Stream(vec![]))
                         .to_stream_vec()
-                        .expect("XREAD: a given key was not to a stream")
+                        .ok_or(RedisError::WrongType)?
                         .iter()
                         .collect(),
                     start_timestamp,
@@ -279,15 +263,18 @@ impl CommandHandler for XReadHandler {
             })
             .collect();
 
-        let result_vec = join_all(futures_vec).await;
-        Ok(vec![RedisResponse::List(result_vec).to_bytes()])
+        let result_vec: Result<Vec<Response>, _> = join_all(futures_vec)
+            .await
+            .into_iter()
+            .collect();
+        Ok(vec![Response::List(result_vec?).to_bytes()])
     }
 }
 
 fn generate_and_validate_stream_id(
     stream_vec: &[StreamElement],
     id: &str,
-) -> Result<String, StreamIdValidationError> {
+) -> Result<String, StreamError> {
     if let Some(last_element) = stream_vec.last() {
         let (last_timestamp, last_sequence) = last_element.id.split_once("-").unwrap();
         let last_timestamp: u128 = last_timestamp.parse().unwrap();
@@ -307,20 +294,16 @@ fn generate_and_validate_stream_id(
             Ok(format!("{timestamp}-{sequence}"))
         } else {
             if id == "0-0" {
-                return Err(StreamIdValidationError::Zero);
+                return Err(StreamError::IdPositive);
             }
 
-            let (timestamp, sequence) = id
-                .split_once("-")
-                .ok_or(StreamIdValidationError::InvalidId(id.to_string()))?;
+            let (timestamp, sequence) = id.split_once("-").ok_or(StreamError::InvalidId)?;
 
-            let timestamp: u128 = timestamp
-                .parse()
-                .map_err(|_| StreamIdValidationError::InvalidTimestamp(timestamp.to_string()))?;
+            let timestamp: u128 = timestamp.parse().map_err(|_| StreamError::InvalidId)?;
 
             let sequence = if sequence == "*" {
                 if timestamp < last_timestamp {
-                    return Err(StreamIdValidationError::DecreasingTimestamp);
+                    return Err(StreamError::IdMonotonic);
                 } else if timestamp == last_timestamp {
                     last_sequence + 1
                 } else {
@@ -328,13 +311,11 @@ fn generate_and_validate_stream_id(
                 }
             } else {
                 if timestamp < last_timestamp {
-                    return Err(StreamIdValidationError::DecreasingTimestamp);
+                    return Err(StreamError::IdMonotonic);
                 }
-                let sequence = sequence
-                    .parse()
-                    .map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?;
+                let sequence = sequence.parse().map_err(|_| StreamError::InvalidId)?;
                 if timestamp == last_timestamp && sequence <= last_sequence {
-                    return Err(StreamIdValidationError::NonincreasingSequence);
+                    return Err(StreamError::IdMonotonic);
                 }
                 sequence
             };
@@ -349,12 +330,8 @@ fn generate_and_validate_stream_id(
 
             Ok(format!("{timestamp}-0"))
         } else {
-            let (timestamp, sequence) = id
-                .split_once("-")
-                .ok_or(StreamIdValidationError::InvalidId(id.to_string()))?;
-            let timestamp: u128 = timestamp
-                .parse()
-                .map_err(|_| StreamIdValidationError::InvalidTimestamp(timestamp.to_string()))?;
+            let (timestamp, sequence) = id.split_once("-").ok_or(StreamError::InvalidId)?;
+            let timestamp: u128 = timestamp.parse().map_err(|_| StreamError::InvalidId)?;
             let sequence: usize = if sequence == "*" {
                 if timestamp == 0 {
                     1
@@ -362,9 +339,7 @@ fn generate_and_validate_stream_id(
                     0
                 }
             } else {
-                sequence
-                    .parse()
-                    .map_err(|_| StreamIdValidationError::InvalidSequence(sequence.to_string()))?
+                sequence.parse().map_err(|_| StreamError::InvalidId)?
             };
 
             Ok(format!("{timestamp}-{sequence}"))
@@ -375,7 +350,7 @@ fn generate_and_validate_stream_id(
 fn parse_id_with_dollar_sign(
     input: &str,
     stream_vec: Option<&Vec<StreamElement>>,
-) -> (u128, usize) {
+) -> Result<(u128, usize), StreamError> {
     let (start_timestamp, start_sequence) = if input == "$" {
         stream_vec
             .and_then(|stream_vec| stream_vec.last())
@@ -386,10 +361,11 @@ fn parse_id_with_dollar_sign(
             .split_once("-")
             .expect(&format!("Start id is invalid: {input}"))
     };
-    (
-        start_timestamp.parse().unwrap(),
-        start_sequence.parse().unwrap(),
-    )
+    let start_timestamp = start_timestamp
+        .parse()
+        .map_err(|_| StreamError::InvalidId)?;
+    let start_sequence = start_sequence.parse().map_err(|_| StreamError::InvalidId)?;
+    Ok((start_timestamp, start_sequence))
 }
 
 fn gather_stream_read_results<'a>(
@@ -397,14 +373,13 @@ fn gather_stream_read_results<'a>(
     start_timestamp: u128,
     start_sequence: usize,
     key: String,
-) -> RedisResponse {
+) -> Result<Response, RedisError> {
     let mut results_vec = Vec::new();
 
     for element in stream_vec {
-        let (timestamp, sequence): (u128, usize) = {
-            let (timestamp, sequence) = element.id.split_once("-").unwrap();
-            (timestamp.parse().unwrap(), sequence.parse().unwrap())
-        };
+        let (timestamp, sequence) = element.id.split_once("-").ok_or(StreamError::InvalidId)?;
+        let timestamp: u128 = timestamp.parse().map_err(|_| StreamError::InvalidId)?;
+        let sequence: usize = sequence.parse().map_err(|_| StreamError::InvalidId)?;
 
         if timestamp > start_timestamp
             || (timestamp == start_timestamp && sequence > start_sequence)
@@ -413,31 +388,28 @@ fn gather_stream_read_results<'a>(
         }
     }
 
-    RedisResponse::from_stream(key, results_vec)
+    Ok(Response::from_stream(key, results_vec))
 }
 
-fn parse_id(input: &str) -> (u128, usize) {
+fn parse_id(input: &str) -> Result<(u128, usize), StreamError> {
     let (start_timestamp, start_sequence) = input
         .split_once("-")
         .expect(&format!("Start id is invalid: {input}"));
-    (
-        start_timestamp.parse().unwrap(),
-        start_sequence.parse().unwrap(),
-    )
+    let start_timestamp = start_timestamp.parse().map_err(|_| StreamError::InvalidId)?;
+    let start_sequence = start_sequence.parse().map_err(|_| StreamError::InvalidId)?;
+    Ok((start_timestamp, start_sequence))
 }
 
 #[derive(Error, Debug)]
-enum StreamIdValidationError {
-    #[error("Invalid stream id: {0}")]
-    InvalidId(String),
-    #[error("Invalid timestamp: {0}")]
-    InvalidTimestamp(String),
-    #[error("Invalid sequence: {0}")]
-    InvalidSequence(String),
-    #[error("Decreasing timestamp")]
-    DecreasingTimestamp,
-    #[error("Nonincreasing sequence")]
-    NonincreasingSequence,
-    #[error("Zero id: 0-0")]
-    Zero,
+pub enum StreamError {
+    #[error("ERR The ID specified in XADD must be greater than 0-0")]
+    IdPositive,
+    #[error("ERR The ID specified in XADD is equal or smaller than the target stream top item")]
+    IdMonotonic,
+    #[error("ERR Invalid stream ID specified as stream command argument")]
+    InvalidId,
+    #[error("ERR timeout is not an integer or out of range")]
+    InvalidTimeout,
+    #[error("ERR timeout is negative")]
+    NegativeTimeout,
 }

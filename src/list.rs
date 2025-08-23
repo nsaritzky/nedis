@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future;
@@ -14,7 +14,8 @@ use crate::{
     command_handler::CommandHandler,
     db_item::DbItem,
     db_value::DbValue,
-    response::RedisResponse,
+    error::RedisError,
+    response::Response,
     shard_map::ShardMapEntry,
     state::{ConnectionState, ServerState},
     utils::bulk_string,
@@ -25,46 +26,45 @@ pub struct RPushHandler;
 impl CommandHandler for RPushHandler {
     async fn execute(
         &self,
-        mut args: Vec<String>,
+        args: Vec<String>,
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
-        let (key, values) = {
-            let mut drain = args.drain(1..);
-            (drain.next(), drain.collect::<Vec<_>>())
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() < 3 {
+            return Err(RedisError::WrongArgs("RPUSH"));
+        }
+        let mut iter = args.into_iter();
+        let _ = iter.next();
+        let key = iter.next().unwrap();
+        let values: Vec<_> = iter.collect();
+
+        let (mut item, size) = match server_state.db.entry(key.clone()).await {
+            ShardMapEntry::Occupied(mut occ) => {
+                let value = occ.get_mut().value_mut();
+                if let DbValue::List(list) = value {
+                    list.append(&mut values.into());
+                    let size = list.len();
+                    (occ.guard(), size)
+                } else {
+                    return Err(RedisError::WrongType);
+                }
+            }
+            ShardMapEntry::Vacant(vac) => {
+                let size = values.len();
+                (
+                    vac.insert(DbItem::new(DbValue::List(values.into()), None)),
+                    size,
+                )
+            }
         };
 
-        if let Some(key) = key {
-            let (mut item, size) = match server_state.db.entry(key.clone()).await {
-                ShardMapEntry::Occupied(mut occ) => {
-                    let value = occ.get_mut().value_mut();
-                    if let DbValue::List(list) = value {
-                        list.append(&mut values.into());
-                        let size = list.len();
-                        (occ.guard(), size)
-                    } else {
-                        bail!("RPUSH: Value at key is not a list")
-                    }
-                }
-                ShardMapEntry::Vacant(vac) => {
-                    let size = values.len();
-                    (
-                        vac.insert(DbItem::new(DbValue::List(values.into()), None)),
-                        size,
-                    )
-                }
-            };
+        item.update_timestamp();
 
-            item.update_timestamp();
+        let msg = BlockMsg::BlPopUnblock(key.clone(), item);
+        server_state.block_tx.send(msg).await?;
 
-            let msg = BlockMsg::BlPopUnblock(key.clone(), item);
-            server_state.block_tx.send(msg).await?;
-
-            Ok(vec![RedisResponse::Int(size as isize).to_bytes()])
-        } else {
-            bail!("Bad key: {key:?}");
-        }
+        Ok(vec![Response::Int(size as isize).to_bytes()])
     }
 }
 
@@ -77,13 +77,14 @@ impl CommandHandler for LRangeHandler {
         server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
-        let empty_array_response = RedisResponse::List(vec![]).to_bytes();
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() != 4 {
+            return Err(RedisError::WrongArgs("LRANGE"));
+        }
         let key = &args[1];
 
-        let db = server_state.db;
-
-        let result = db
+        let result = server_state
+            .db
             .with_value(key, |item| {
                 if let DbValue::List(array) = item.value() {
                     if let (Some(a), Some(b)) = (args.get(2), args.get(3)) {
@@ -101,20 +102,17 @@ impl CommandHandler for LRangeHandler {
                         };
 
                         if a >= array.len() {
-                            Ok(vec![empty_array_response])
+                            Ok(vec![Response::Empty.to_bytes()])
                         } else if b > array.len() - 1 {
-                            let resp = RedisResponse::List(
-                                array
-                                    .range(a..)
-                                    .map(|s| RedisResponse::Str(s.clone()))
-                                    .collect(),
+                            let resp = Response::List(
+                                array.range(a..).map(|s| Response::Str(s.clone())).collect(),
                             );
                             Ok(vec![resp.to_bytes()])
                         } else {
-                            let resp = RedisResponse::List(
+                            let resp = Response::List(
                                 array
                                     .range(a..=b)
-                                    .map(|s| RedisResponse::Str(s.clone()))
+                                    .map(|s| Response::Str(s.clone()))
                                     .collect(),
                             );
                             Ok(vec![resp.to_bytes()])
@@ -123,7 +121,7 @@ impl CommandHandler for LRangeHandler {
                         bail!("Failed to get array bounds");
                     }
                 } else {
-                    Ok(vec![empty_array_response])
+                    Ok(vec![Response::Empty.to_bytes()])
                 }
             })
             .await;
@@ -131,7 +129,7 @@ impl CommandHandler for LRangeHandler {
         if let Some(Ok(resp)) = result {
             Ok(resp)
         } else {
-            Ok(vec!["*0\r\n".into()])
+            Ok(vec![Response::Empty.to_bytes()])
         }
     }
 }
@@ -145,44 +143,43 @@ impl CommandHandler for LPushHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() < 3 {
+            return Err(RedisError::WrongArgs("LPUSH"));
+        }
         let (key, values) = {
             let mut drain = args.drain(1..);
-            (drain.next(), drain.collect::<Vec<_>>())
+            (drain.next().unwrap(), drain.collect::<Vec<_>>())
         };
 
-        if let Some(key) = key {
-            let (mut item, size) = match server_state.db.entry(key.clone()).await {
-                ShardMapEntry::Occupied(mut occ) => {
-                    let value = occ.get_mut().value_mut();
-                    if let DbValue::List(list) = value {
-                        for v in values {
-                            list.push_front(v);
-                        }
-                        let size = list.len();
-                        (occ.guard(), size)
-                    } else {
-                        bail!("LPUSH: Value at key is not a list")
+        let (mut item, size) = match server_state.db.entry(key.clone()).await {
+            ShardMapEntry::Occupied(mut occ) => {
+                let value = occ.get_mut().value_mut();
+                if let DbValue::List(list) = value {
+                    for v in values {
+                        list.push_front(v);
                     }
+                    let size = list.len();
+                    (occ.guard(), size)
+                } else {
+                    return Err(RedisError::WrongType)
                 }
-                ShardMapEntry::Vacant(vac) => {
-                    let size = values.len();
-                    (
-                        vac.insert(DbItem::new(DbValue::List(values.into()), None)),
-                        size,
-                    )
-                }
-            };
+            }
+            ShardMapEntry::Vacant(vac) => {
+                let size = values.len();
+                (
+                    vac.insert(DbItem::new(DbValue::List(values.into()), None)),
+                    size,
+                )
+            }
+        };
 
-            item.update_timestamp();
+        item.update_timestamp();
 
-            let msg = BlockMsg::BlPopUnblock(key.clone(), item);
-            server_state.block_tx.send(msg).await?;
+        let msg = BlockMsg::BlPopUnblock(key.clone(), item);
+        server_state.block_tx.send(msg).await?;
 
-            Ok(vec![RedisResponse::Int(size as isize).to_bytes()])
-        } else {
-            bail!("Bad key: {key:?}");
-        }
+        Ok(vec![Response::Int(size as isize).to_bytes()])
     }
 }
 
@@ -195,16 +192,19 @@ impl CommandHandler for LLenHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
+        if args.len() < 2 {
+            return Err(RedisError::WrongArgs("LLEN"));
+        }
         let key = &args[1];
         let value = server_state.db.get(key).await;
         if let Some(DbValue::List(array)) = value.as_deref() {
             let size = array.len() as isize;
-            let resp = RedisResponse::Int(size);
+            let resp = Response::Int(size);
 
             Ok(vec![resp.to_bytes()])
         } else {
-            let zero_resp = RedisResponse::Int(0);
+            let zero_resp = Response::Int(0);
 
             Ok(vec![zero_resp.to_bytes()])
         }
@@ -220,9 +220,9 @@ impl CommandHandler for LPopHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() < 2 {
-            bail!("LPOP: Wrong number of arguments")
+            return Err(RedisError::WrongArgs("LPOP"))
         }
         let empty_response = "$-1\r\n";
         let key = &args[1];
@@ -235,7 +235,7 @@ impl CommandHandler for LPopHandler {
                 if array.len() == 0 {
                     return Ok(vec![empty_response.into()]);
                 } else if let Some(n) = n {
-                    let resp_vec: RedisResponse = if n >= array.len() {
+                    let resp_vec: Response = if n >= array.len() {
                         array.drain(..).collect()
                     } else {
                         array.drain(..n).collect()
@@ -246,7 +246,7 @@ impl CommandHandler for LPopHandler {
                     result = Ok(vec![bulk_string(&result_value)]);
                 }
             } else {
-                bail!("BPOP: Value at key is not a list")
+                return Err(RedisError::WrongType)
             }
             item.update_timestamp();
         } else {
@@ -266,18 +266,18 @@ impl CommandHandler for BLPopHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         let key = &args[1];
 
         if let Some(mut item) = server_state.db.get_mut(key).await {
             if let DbValue::List(list) = item.value_mut() {
                 if let Some(result) = list.pop_front() {
                     item.update_timestamp();
-                    let resp: RedisResponse = vec![key.clone(), result].into_iter().collect();
+                    let resp: Response = vec![key.clone(), result].into_iter().collect();
                     return Ok(vec![resp.to_bytes()]);
                 }
             } else {
-                bail!("BLPOP: Value at key is not a list")
+                return Err(RedisError::WrongType);
             }
         }
 
@@ -299,9 +299,9 @@ impl CommandHandler for BLPopHandler {
 
         tokio::select! {
             result = return_rx => result.and_then(|value| {
-                    let resp: RedisResponse = vec![key.clone(), value].into_iter().collect();
+                    let resp: Response = vec![key.clone(), value].into_iter().collect();
                     Ok(vec![resp.to_bytes()])
-                }).map_err(|_| anyhow!("BLPOP: Failed to receive return value from blocking handler")),
+                }).map_err(|_| RedisError::InternalError),
             _ = sleep_until_if(expires) => Ok(vec!["$-1\r\n".into()])
         }
     }

@@ -1,4 +1,3 @@
-use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -6,7 +5,8 @@ use crate::{
     command_handler::CommandHandler,
     db_item::DbItem,
     db_value::DbValue,
-    response::RedisResponse,
+    error::RedisError,
+    response::Response,
     shard_map::ShardMapEntry,
     skip_list::SkipList,
     state::{ConnectionState, ServerState},
@@ -146,9 +146,9 @@ impl CommandHandler for ZADDHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 4 {
-            bail!("ZADD: Wrong number of arguments");
+            return Err(RedisError::WrongArgs("ZADD"));
         }
         let [_command, key, score, value] = args.try_into().unwrap();
         let score: f64 = score.parse().unwrap();
@@ -165,7 +165,7 @@ impl CommandHandler for ZADDHandler {
                             count = 1;
                         }
                     }
-                    _ => bail!("ZADD: Value at key is not a zset"),
+                    _ => return Err(RedisError::WrongType),
                 }
                 if count == 1 {
                     item.update_timestamp();
@@ -179,7 +179,7 @@ impl CommandHandler for ZADDHandler {
             }
         };
 
-        Ok(vec![RedisResponse::Int(count as isize).to_bytes()])
+        Ok(vec![Response::Int(count as isize).to_bytes()])
     }
 }
 
@@ -192,9 +192,9 @@ impl CommandHandler for ZRankHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 3 {
-            bail!("ZRANK: Wrong number of args");
+            return Err(RedisError::WrongArgs("ZRANK"));
         }
         let [_command, zset_key, zset_item] = args.try_into().unwrap();
 
@@ -203,13 +203,13 @@ impl CommandHandler for ZRankHandler {
         match value.as_deref() {
             Some(DbValue::ZSet(zset)) => {
                 if let Some(rank) = zset.get_rank(&zset_item) {
-                    Ok(vec![RedisResponse::Int(rank as isize).to_bytes()])
+                    Ok(vec![Response::Int(rank as isize).to_bytes()])
                 } else {
-                    Ok(vec!["$-1\r\n".into()])
+                    Ok(vec![Response::Nil.to_bytes()])
                 }
             }
-            Some(_) => bail!("ZRANK: Value at key is not a zset"),
-            None => Ok(vec!["$-1\r\n".into()]),
+            Some(_) => Err(RedisError::WrongType),
+            None => Ok(vec![Response::Nil.to_bytes()]),
         }
     }
 }
@@ -223,9 +223,9 @@ impl CommandHandler for ZRangeHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 4 {
-            bail!("ZRANGE: Wrong number of args");
+            return Err(RedisError::WrongArgs("ZRANGE"));
         }
         let [_command, redis_key, min, max] = args.try_into().unwrap();
         let min: isize = min.parse().unwrap();
@@ -246,11 +246,11 @@ impl CommandHandler for ZRangeHandler {
                 } as usize;
                 zset.get_index_range(min, max)
             }
-            Some(_) => bail!("ZRANGE: Value at key is not a zset"),
+            Some(_) => return Err(RedisError::WrongType),
             None => vec![],
         };
 
-        let resp: RedisResponse = result.into_iter().collect();
+        let resp: Response = result.into_iter().collect();
         Ok(vec![resp.to_bytes()])
     }
 }
@@ -264,20 +264,20 @@ impl CommandHandler for ZCardHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 2 {
-            bail!("ZCARD: Wrong number of arguments")
+            return Err(RedisError::WrongArgs("ZCARD"));
         }
         let [_command, redis_key] = args.try_into().unwrap();
 
         let value = server_state.db.get(&redis_key).await;
         let result = match value.as_deref() {
             Some(DbValue::ZSet(zset)) => zset.len(),
-            Some(_) => bail!("ZCARD: Value at key is not a zset"),
+            Some(_) => return Err(RedisError::WrongType),
             None => 0,
         };
 
-        Ok(vec![RedisResponse::Int(result as isize).to_bytes()])
+        Ok(vec![Response::Int(result as isize).to_bytes()])
     }
 }
 
@@ -290,21 +290,21 @@ impl CommandHandler for ZScoreHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 3 {
-            bail!("ZSCORE: Wrong number of args")
+            return Err(RedisError::WrongArgs("ZSCORE"));
         }
         let [_command, zset_key, zset_item] = args.try_into().unwrap();
 
         let value = server_state.db.get(&zset_key).await;
         let score = match value.as_deref() {
             Some(DbValue::ZSet(zset)) => zset.get_score(&zset_item),
-            Some(_) => bail!("ZSCORE: value at key is not a zset"),
+            Some(_) => return Err(RedisError::WrongType),
             None => None,
         };
 
         if let Some(score) = score {
-            Ok(vec![RedisResponse::Str(score.to_string()).to_bytes()])
+            Ok(vec![Response::Str(score.to_string()).to_bytes()])
         } else {
             Ok(vec!["$-1\r\n".into()])
         }
@@ -320,9 +320,9 @@ impl CommandHandler for ZRemHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 3 {
-            bail!("ZREM: Wrong number of args");
+            return Err(RedisError::WrongArgs("ZREM"));
         }
         let [_command, zset_key, zset_item] = args.try_into().unwrap();
 
@@ -339,7 +339,7 @@ impl CommandHandler for ZRemHandler {
                     Ok(vec![":0\r\n".into()])
                 }
             } else {
-                bail!("ZREM: Value at key is not a zset");
+                Err(RedisError::WrongType)
             }
         } else {
             Ok(vec![":0\r\n".into()])

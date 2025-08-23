@@ -1,11 +1,10 @@
 use std::collections::hash_map::Entry;
 
-use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::{
-    command_handler::CommandHandler, db_item::DbItem, db_value::DbValue, redis_value::RedisValue, state::{ConnectionState, ServerState}
+    command_handler::CommandHandler, db_item::DbItem, db_value::DbValue, error::RedisError, redis_value::RedisValue, state::{ConnectionState, ServerState}
 };
 
 pub struct IncrHandler;
@@ -17,9 +16,9 @@ impl CommandHandler for IncrHandler {
         mut server_state: ServerState,
         _connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 2 {
-            bail!("INCR: Wrong number of args")
+            return Err(RedisError::WrongArgs("INCR"));
         }
         let key = &args[1];
 
@@ -50,9 +49,7 @@ impl CommandHandler for IncrHandler {
             let resp_val: RedisValue = n.into();
             Ok(vec![resp_val.to_bytes()])
         } else {
-            Ok(vec![
-                "-ERR value is not an integer or out of range\r\n".into()
-            ])
+            Err(RedisError::OutOfRange)
         }
     }
 }
@@ -66,7 +63,7 @@ impl CommandHandler for MultiHandler {
         _server_state: ServerState,
         mut connection_state: ConnectionState,
         _message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         connection_state.set_transaction_active(true);
         Ok(vec!["+OK\r\n".into()])
     }
@@ -81,7 +78,7 @@ impl CommandHandler for WatchHandler {
         _server_state: ServerState,
         mut connection_state: ConnectionState,
         _message_len: usize
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         connection_state.watch_keys(args.drain(1..).collect()).await;
         Ok(vec!["+OK\r\n".into()])
     }
@@ -96,7 +93,7 @@ impl CommandHandler for UnwatchHandler {
         _server_state: ServerState,
         mut connection_state: ConnectionState,
         _message_len: usize
-    ) -> anyhow::Result<Vec<Bytes>> {
+    ) -> Result<Vec<Bytes>, RedisError> {
         connection_state.drain_watched_keys().await;
         Ok(vec!["$-1\r\n".into()])
     }

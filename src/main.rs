@@ -5,6 +5,7 @@ mod command_registry;
 mod db;
 mod db_item;
 mod db_value;
+mod error;
 mod global_config;
 mod hash;
 mod hex;
@@ -40,10 +41,11 @@ use blocking::run_block_handler;
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use command_registry::REGISTRY;
+use error::RedisError;
 use global_config::{GlobalConfig, MasterConfig, SlaveConfig};
 use itertools::Itertools;
 use rdb_parser::parse_db;
-use response::RedisResponse;
+use response::Response;
 use state::{ConnectionState, ConnectionType, ServerState};
 use tokio::sync::broadcast;
 use tokio::{
@@ -312,7 +314,8 @@ async fn process_input(
                 if WRITE_COMMANDS.contains(&args[0].as_str()) {
                     master_state.add_to_offset(message_len);
                     master_state
-                        .broadcast_to_replicas(RedisResponse::from_str_vec(&args).to_bytes())?;
+                        .broadcast_to_replicas(Response::from_str_vec(&args).to_bytes())
+                        .map_err(|_| anyhow!("Error broadcasting to replicas"))?;
                 }
             } else if !args[0].to_ascii_uppercase().starts_with("FULLRESYNC") {
                 server_state.add_to_replica_offset(message_len)?;
@@ -354,9 +357,13 @@ pub async fn execute_command(
     let _tlock = server_state_clone.transaction_lock.read().await;
 
     if let Some(handler) = REGISTRY.get(command.as_str()) {
-        handler
+        match handler
             .execute(v, server_state, connection_state, message_len)
             .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(err) => Ok(vec![format!("-{err}\r\n").into()]),
+        }
     } else if command.starts_with("FULLRESYNC") {
         println!("Got FULLRESYNC. Not responding.");
         Ok(vec![])
@@ -465,7 +472,7 @@ async fn handle_discard(mut connection_state: ConnectionState) -> Vec<Bytes> {
     vec!["+OK\r\n".into()]
 }
 
-fn send_getack(mut server_state: ServerState) -> anyhow::Result<()> {
+fn send_getack(mut server_state: ServerState) -> Result<(), RedisError> {
     let resp: Bytes = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n".into();
     server_state.add_to_master_offset(resp.len())?;
     server_state

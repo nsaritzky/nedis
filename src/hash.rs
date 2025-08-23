@@ -5,7 +5,7 @@ use bytes::Bytes;
 use itertools::Itertools;
 
 use crate::{
-    db_item::DbItem, db_value::DbValue, response::RedisResponse, shard_map::ShardMapEntry, state::ServerState
+    db_item::DbItem, db_value::DbValue, response::Response, shard_map::ShardMapEntry, state::ServerState
 };
 
 pub async fn handle_hget(mut server_state: ServerState, v: &Vec<String>) -> anyhow::Result<Vec<Bytes>> {
@@ -66,5 +66,5 @@ pub async fn handle_hset(
         }
     };
 
-    result.map(|n| vec![RedisResponse::Int(n as isize).to_bytes()])
+    result.map(|n| vec![Response::Int(n as isize).to_bytes()])
 }

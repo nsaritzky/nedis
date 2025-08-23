@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::state::{ConnectionState, ServerState};
+use crate::{error::RedisError, state::{ConnectionState, ServerState}};
 
 #[async_trait]
 pub trait CommandHandler {
@@ -11,5 +11,5 @@ pub trait CommandHandler {
         mut server_state: ServerState,
         mut connection_state: ConnectionState,
         message_len: usize,
-    ) -> anyhow::Result<Vec<Bytes>>;
+    ) -> Result<Vec<Bytes>, RedisError>;
 }

@@ -7,7 +7,6 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{anyhow, bail};
 use atomic_enum::atomic_enum;
 use bytes::Bytes;
 use either::Either;
@@ -15,7 +14,7 @@ use futures::future::join_all;
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
 use crate::{
-    blocking::BlockMsg, db::Db, db_item::DbItem, replica_tracker::ReplicaTracker, shard_map::ShardMap
+    blocking::BlockMsg, db::Db, db_item::DbItem, error::{InternalError, RedisError}, replica_tracker::ReplicaTracker, shard_map::ShardMap
 };
 
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
@@ -88,9 +87,9 @@ impl ServerState {
         self.state.right()
     }
 
-    pub fn add_to_replica_offset(&mut self, message_len: usize) -> anyhow::Result<()> {
+    pub fn add_to_replica_offset(&mut self, message_len: usize) -> Result<(), InternalError> {
         match &self.state {
-            Either::Left(_) => bail!("Tried to add to replica offset on the master"),
+            Either::Left(_) => Err(InternalError::ReplicaCommandOnMaster),
             Either::Right(replica) => {
                 replica.offset.fetch_add(message_len, Ordering::SeqCst);
                 Ok(())
@@ -98,13 +97,13 @@ impl ServerState {
         }
     }
 
-    pub fn add_to_master_offset(&mut self, message_len: usize) -> anyhow::Result<()> {
+    pub fn add_to_master_offset(&mut self, message_len: usize) -> Result<(), InternalError> {
         match &self.state {
             Either::Left(master) => {
                 master.offset.fetch_add(message_len, Ordering::SeqCst);
                 Ok(())
             }
-            Either::Right(_) => bail!("Tried to add to master offset on a replica"),
+            Either::Right(_) => Err(InternalError::MasterCommandOnReplica),
         }
     }
 
@@ -152,7 +151,7 @@ impl ServerState {
         subs.get(key).map(|senders| senders.len()).unwrap_or(0)
     }
 
-    pub async fn publish_subscription_message(&self, key: &str, msg: String) -> anyhow::Result<()> {
+    pub async fn publish_subscription_message(&self, key: &str, msg: String) -> Result<(), InternalError> {
         let subs = self.subscriptions.read().await;
         if let Some(senders) = subs.get(key) {
             let futures = senders.iter().map(|(_, tx)| {
@@ -162,12 +161,12 @@ impl ServerState {
             let results = join_all(futures).await;
             let failures = results.into_iter().filter(|res| res.is_err()).count();
             if failures > 0 {
-                bail!("Failed to send subsrciption message {msg} to {failures} receivers");
+                Err(InternalError::SubscriptionSendFailure)
             } else {
                 Ok(())
             }
         } else {
-            bail!("Subscripion key error: {key}");
+            Ok(())
         }
     }
 
@@ -185,11 +184,11 @@ impl MasterState {
         }
     }
 
-    pub fn broadcast_to_replicas(&self, msg: Bytes) -> anyhow::Result<()> {
+    pub fn broadcast_to_replicas(&self, msg: Bytes) -> Result<(), RedisError> {
         let _ = self
             .replica_tx
             .send(msg)
-            .map_err(|_| anyhow!("Failed to broadcast to replicas"))?;
+            .map_err(|_| RedisError::InternalError)?;
         Ok(())
     }
 
@@ -278,12 +277,12 @@ impl ConnectionState {
         self.transaction_active.store(active, Ordering::Relaxed)
     }
 
-    pub fn set_replica_id(&mut self, new_id: usize) -> anyhow::Result<()> {
+    pub fn set_replica_id(&mut self, new_id: usize) -> Result<(), RedisError> {
         if self.replica_id.load(Ordering::Relaxed) != UNSET {
-            bail!("Tried to set replica id, but it's already set")
+            return Err(RedisError::InternalError)
         }
         if !self.is_master {
-            bail!("Tried to set replica id on the replica itself")
+            return Err(RedisError::InternalError)
         }
         self.replica_id.store(new_id, Ordering::Relaxed);
         Ok(())

@@ -8,6 +8,7 @@ use tokio::{
 
 use crate::{db_item::DbItem, db_value::DbValue, state::ServerState};
 
+#[derive(Debug)]
 pub enum BlockMsg {
     BlPop(String, Option<Instant>, oneshot::Sender<String>),
     //  XRead(String, Option<SystemTime>, oneshot::Sender<String>),
