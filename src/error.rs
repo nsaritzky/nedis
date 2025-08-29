@@ -2,7 +2,8 @@ use std::any::Any;
 
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
-
+use crate::geo;
+use crate::geo::GeoError;
 use crate::stream::StreamError;
 
 #[derive(Error, Debug)]
@@ -35,6 +36,8 @@ pub enum RedisError {
     NegativeTimeout,
     #[error("ERR internal server error")]
     TypedInternalError(#[from] InternalError),
+    #[error("{0}")]
+    GeoError(#[from] GeoError),
 }
 
 impl<T: Send + 'static> From<mpsc::error::SendError<T>> for RedisError {
