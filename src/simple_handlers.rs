@@ -111,7 +111,7 @@ impl CommandHandler for GetHandler {
         match value.as_deref() {
             Some(DbValue::String(s)) => Ok(vec![Response::Str(s.to_string()).to_bytes()]),
             Some(_) => Err(RedisError::WrongType),
-            None => Ok(vec![Response::Nil.to_bytes()]),
+            None => Ok(vec![Response::NilStr.to_bytes()]),
         }
     }
 }
@@ -192,7 +192,7 @@ impl CommandHandler for ConfigHandler {
                 let resp = Response::from_str_vec(&vec![key, value]);
                 Ok(vec![resp.to_bytes()])
             }
-            cmd => Err(RedisError::InvalidConfigCommand(cmd.to_string()))
+            cmd => Err(RedisError::InvalidConfigCommand(cmd.to_string())),
         }
     }
 }

@@ -1,7 +1,7 @@
 use std::{
     borrow::Borrow,
     collections::{
-        hash_map::{self},
+        hash_map::{self, Entry},
         HashMap,
     },
     future::Future,
@@ -14,7 +14,8 @@ use std::{
 
 use futures::future::join_all;
 use tokio::sync::{
-    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard
+    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
+    RwLockReadGuard,
 };
 
 #[derive(Debug, Clone)]
@@ -245,7 +246,10 @@ where
         RwLockReadGuard::try_map(guard, |m| m.get(key)).ok()
     }
 
-    pub async fn get_mut<Q>(&mut self, key: &Q) -> Option<OwnedRwLockMappedWriteGuard<HashMap<K, V>, V>>
+    pub async fn get_mut<Q>(
+        &mut self,
+        key: &Q,
+    ) -> Option<OwnedRwLockMappedWriteGuard<HashMap<K, V>, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -254,7 +258,11 @@ where
         OwnedRwLockWriteGuard::try_map(guard, |m| m.get_mut(key)).ok()
     }
 
-    pub async fn get_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<OwnedRwLockReadGuard<HashMap<K, V>, V>>
+    pub async fn get_or_remove<Q, F>(
+        &self,
+        key: &Q,
+        f: F,
+    ) -> Option<OwnedRwLockReadGuard<HashMap<K, V>, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -267,14 +275,20 @@ where
                 None
             } else {
                 let read_guard = guard.downgrade();
-                Some(OwnedRwLockReadGuard::map(read_guard, |g| g.get(key).unwrap()))
+                Some(OwnedRwLockReadGuard::map(read_guard, |g| {
+                    g.get(key).unwrap()
+                }))
             }
         } else {
             None
         }
     }
 
-    pub async fn get_mut_or_remove<Q, F>(&self, key: &Q, f: F) -> Option<OwnedRwLockMappedWriteGuard<HashMap<K, V>, V>>
+    pub async fn get_mut_or_remove<Q, F>(
+        &self,
+        key: &Q,
+        f: F,
+    ) -> Option<OwnedRwLockMappedWriteGuard<HashMap<K, V>, V>>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -286,11 +300,21 @@ where
                 guard.remove(key);
                 None
             } else {
-                Some(OwnedRwLockWriteGuard::map(guard, |g| g.get_mut(key).unwrap()))
+                Some(OwnedRwLockWriteGuard::map(guard, |g| {
+                    g.get_mut(key).unwrap()
+                }))
             }
         } else {
             None
         }
+    }
+
+    pub async fn get_mut_or_insert(&mut self, key: K, default: V) -> OwnedRwLockMappedWriteGuard<HashMap<K, V>, V> {
+        let guard = self.get_bucket_mut(&key).await;
+        OwnedRwLockWriteGuard::map(guard, |g| {
+            let entry = g.entry(key);
+            entry.or_insert(default)
+        })
     }
 
     pub async fn insert(&mut self, key: K, value: V) -> Option<V> {

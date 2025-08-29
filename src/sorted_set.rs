@@ -205,11 +205,11 @@ impl CommandHandler for ZRankHandler {
                 if let Some(rank) = zset.get_rank(&zset_item) {
                     Ok(vec![Response::Int(rank as isize).to_bytes()])
                 } else {
-                    Ok(vec![Response::Nil.to_bytes()])
+                    Ok(vec![Response::NilStr.to_bytes()])
                 }
             }
             Some(_) => Err(RedisError::WrongType),
-            None => Ok(vec![Response::Nil.to_bytes()]),
+            None => Ok(vec![Response::NilStr.to_bytes()]),
         }
     }
 }

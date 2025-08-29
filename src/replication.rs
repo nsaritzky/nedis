@@ -5,7 +5,11 @@ use bytes::Bytes;
 use tokio::time::interval;
 
 use crate::{
-    command_handler::CommandHandler, error::RedisError, response::Response, state::{ConnectionState, ConnectionType, ServerState}, EMPTY_RDB_BYTES, GLOBAL_CONFIG
+    command_handler::CommandHandler,
+    error::RedisError,
+    response::Response,
+    state::{ConnectionState, ConnectionType, ServerState},
+    EMPTY_RDB_BYTES, GLOBAL_CONFIG,
 };
 
 pub struct PSyncHandler;
@@ -96,8 +100,12 @@ impl CommandHandler for WaitHandler {
         }
         if let Some(master_state) = server_state.clone().master_state() {
             let GETACK_MSG_LEN = 37;
-            let n = args[1].parse::<usize>().map_err(|_| RedisError::InvalidTimeout)?;
-            let timeout = args[2].parse::<i64>().map_err(|_| RedisError::InvalidTimeout)?;
+            let n = args[1]
+                .parse::<usize>()
+                .map_err(|_| RedisError::InvalidTimeout)?;
+            let timeout = args[2]
+                .parse::<i64>()
+                .map_err(|_| RedisError::InvalidTimeout)?;
             if timeout < 0 {
                 return Err(RedisError::NegativeTimeout);
             }

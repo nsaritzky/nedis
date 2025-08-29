@@ -9,8 +9,8 @@ use crate::{
     replication::{PSyncHandler, ReplConfHandler, WaitHandler},
     set::{SADDHandler, SCARDHandler, SINTERHandler, SISMEMBERHandler, SREMHandler},
     simple_handlers::{
-        ConfigHandler, ConstantHandler, EchoHandler, EmptyRDBHandler, GetHandler,
-        InfoHandler, KeysHandler, PingHandler, SetHandler, TypeHandler,
+        ConfigHandler, ConstantHandler, EchoHandler, EmptyRDBHandler, GetHandler, InfoHandler,
+        KeysHandler, PingHandler, SetHandler, TypeHandler,
     },
     sorted_set::{
         ZADDHandler, ZCardHandler, ZRangeHandler, ZRankHandler, ZRemHandler, ZScoreHandler,
@@ -18,6 +18,7 @@ use crate::{
     stream::{XADDHandler, XRangeHandler, XReadHandler},
     transactions::{IncrHandler, MultiHandler, UnwatchHandler, WatchHandler},
 };
+use crate::geo::GeoAddHandler;
 
 pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + Sync>>> =
     Lazy::new(|| {
@@ -71,5 +72,6 @@ pub static REGISTRY: Lazy<HashMap<&'static str, Box<dyn CommandHandler + Send + 
         registry.insert("ZREM", Box::new(ZRemHandler));
         registry.insert("WATCH", Box::new(WatchHandler));
         registry.insert("UNWATCH", Box::new(UnwatchHandler));
+        registry.insert("GEOADD", Box::new(GeoAddHandler));
         registry
     });

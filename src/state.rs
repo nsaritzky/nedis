@@ -14,7 +14,12 @@ use futures::future::join_all;
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, RwLock};
 
 use crate::{
-    blocking::BlockMsg, db::Db, db_item::DbItem, error::{InternalError, RedisError}, replica_tracker::ReplicaTracker, shard_map::ShardMap
+    blocking::BlockMsg,
+    db::Db,
+    db_item::DbItem,
+    error::{InternalError, RedisError},
+    replica_tracker::ReplicaTracker,
+    shard_map::ShardMap,
 };
 
 type Blocks = Arc<Mutex<HashMap<String, BTreeSet<(SystemTime, String)>>>>;
@@ -68,7 +73,7 @@ impl ServerState {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
             transaction_lock: Arc::new(RwLock::new(())),
-            block_tx
+            block_tx,
         }
     }
 
@@ -151,7 +156,11 @@ impl ServerState {
         subs.get(key).map(|senders| senders.len()).unwrap_or(0)
     }
 
-    pub async fn publish_subscription_message(&self, key: &str, msg: String) -> Result<(), InternalError> {
+    pub async fn publish_subscription_message(
+        &self,
+        key: &str,
+        msg: String,
+    ) -> Result<(), InternalError> {
         let subs = self.subscriptions.read().await;
         if let Some(senders) = subs.get(key) {
             let futures = senders.iter().map(|(_, tx)| {
@@ -279,10 +288,10 @@ impl ConnectionState {
 
     pub fn set_replica_id(&mut self, new_id: usize) -> Result<(), RedisError> {
         if self.replica_id.load(Ordering::Relaxed) != UNSET {
-            return Err(RedisError::InternalError)
+            return Err(RedisError::InternalError);
         }
         if !self.is_master {
-            return Err(RedisError::InternalError)
+            return Err(RedisError::InternalError);
         }
         self.replica_id.store(new_id, Ordering::Relaxed);
         Ok(())

@@ -3,10 +3,9 @@ use std::time::Duration;
 use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::future;
 use tokio::{
     sync::oneshot,
-    time::{sleep_until, Instant},
+    time::Instant,
 };
 
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
     response::Response,
     shard_map::ShardMapEntry,
     state::{ConnectionState, ServerState},
-    utils::bulk_string,
+    utils::{bulk_string, sleep_until_if},
 };
 
 pub struct RPushHandler;
@@ -162,7 +161,7 @@ impl CommandHandler for LPushHandler {
                     let size = list.len();
                     (occ.guard(), size)
                 } else {
-                    return Err(RedisError::WrongType)
+                    return Err(RedisError::WrongType);
                 }
             }
             ShardMapEntry::Vacant(vac) => {
@@ -222,9 +221,8 @@ impl CommandHandler for LPopHandler {
         _message_len: usize,
     ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() < 2 {
-            return Err(RedisError::WrongArgs("LPOP"))
+            return Err(RedisError::WrongArgs("LPOP"));
         }
-        let empty_response = "$-1\r\n";
         let key = &args[1];
         let n: Option<usize> = args.get(2).and_then(|s| s.parse().ok());
 
@@ -233,7 +231,7 @@ impl CommandHandler for LPopHandler {
             let value = item.value_mut();
             if let DbValue::List(ref mut array) = value {
                 if array.len() == 0 {
-                    return Ok(vec![empty_response.into()]);
+                    return Ok(vec![Response::NilStr.to_bytes()]);
                 } else if let Some(n) = n {
                     let resp_vec: Response = if n >= array.len() {
                         array.drain(..).collect()
@@ -246,11 +244,11 @@ impl CommandHandler for LPopHandler {
                     result = Ok(vec![bulk_string(&result_value)]);
                 }
             } else {
-                return Err(RedisError::WrongType)
+                return Err(RedisError::WrongType);
             }
             item.update_timestamp();
         } else {
-            return Ok(vec![empty_response.into()]);
+            return Ok(vec![Response::NilStr.to_bytes()]);
         }
 
         return result;
@@ -302,15 +300,7 @@ impl CommandHandler for BLPopHandler {
                     let resp: Response = vec![key.clone(), value].into_iter().collect();
                     Ok(vec![resp.to_bytes()])
                 }).map_err(|_| RedisError::InternalError),
-            _ = sleep_until_if(expires) => Ok(vec!["$-1\r\n".into()])
+            _ = sleep_until_if(expires) => Ok(vec![Response::NilArr.to_bytes()])
         }
-    }
-}
-
-async fn sleep_until_if(until: Option<Instant>) {
-    if let Some(instant) = until {
-        sleep_until(instant).await
-    } else {
-        future::pending::<()>().await
     }
 }

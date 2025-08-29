@@ -1,4 +1,9 @@
-use std::{borrow::Borrow, collections::VecDeque, hash::{Hash, Hasher}, ptr::NonNull};
+use std::{
+    borrow::Borrow,
+    collections::VecDeque,
+    hash::{Hash, Hasher},
+    ptr::NonNull,
+};
 
 use rand::Rng;
 use std::fmt::Debug;
@@ -224,7 +229,7 @@ impl<T: Ord> SkipList<T> {
         unsafe {
             Iter {
                 next: node.as_ptr().as_ref(),
-                len: self.len - rank
+                len: self.len - rank,
             }
         }
     }
@@ -245,7 +250,7 @@ impl<T: Ord> SkipList<T> {
         unsafe {
             Iter {
                 next: node.as_ptr().as_ref(),
-                len: self.len - index
+                len: self.len - index,
             }
         }
     }

@@ -6,7 +6,8 @@ pub enum Response {
     Str(String),
     Int(isize),
     List(Vec<Response>),
-    Nil,
+    NilStr,
+    NilArr,
     Empty,
     Ok,
 }
@@ -24,7 +25,8 @@ impl Response {
                 }
                 buf.freeze()
             }
-            Response::Nil => "$-1\r\n".into(),
+            Response::NilStr => "$-1\r\n".into(),
+            Response::NilArr => "*-1\r\n".into(),
             Response::Empty => "*0\r\n".into(),
             Response::Ok => "+OK\r\n".into(),
         }
@@ -34,14 +36,35 @@ impl Response {
         Response::List(v.iter().map(|s| Response::Str(s.clone())).collect())
     }
 
-    pub fn from_stream(key: String, value: Vec<&StreamElement>) -> Self {
+    pub fn from_stream(key: String, value: &[&StreamElement]) -> Self {
         Response::List(vec![
             key.into(),
             value
                 .into_iter()
                 .map(|element| {
                     Response::List(vec![
-                        Response::Str(element.id.clone()),
+                        Response::Str(element.id.to_string()),
+                        Response::List(
+                            element
+                                .value
+                                .iter()
+                                .flat_map(|(k, v)| [k.clone().into(), v.clone().into()])
+                                .collect(),
+                        ),
+                    ])
+                })
+                .collect(),
+        ])
+    }
+
+    pub fn from_stream_owned(key: String, value: Vec<StreamElement>) -> Self {
+        Response::List(vec![
+            key.into(),
+            value
+                .into_iter()
+                .map(|element| {
+                    Response::List(vec![
+                        Response::Str(element.id.to_string()),
                         Response::List(
                             element
                                 .value
@@ -82,14 +105,12 @@ impl From<&DbValue> for Response {
     fn from(value: &DbValue) -> Self {
         match value {
             DbValue::String(s) => Response::Str(s.clone()),
-            DbValue::List(arr) => {
-                Response::from_str_vec(&arr.iter().map(|s| s.clone()).collect())
-            }
+            DbValue::List(arr) => Response::from_str_vec(&arr.iter().map(|s| s.clone()).collect()),
             DbValue::Stream(arr) => Response::List(
                 arr.iter()
                     .map(|elt| {
                         Response::List(vec![
-                            Response::Str(elt.id.clone()),
+                            Response::Str(elt.id.to_string()),
                             Response::List(
                                 elt.value
                                     .iter()
@@ -107,7 +128,7 @@ impl From<&DbValue> for Response {
             ),
             DbValue::Set(set) => set.iter().collect(),
             DbValue::ZSet(zset) => zset.iter().collect(),
-            DbValue::Empty => Response::Nil,
+            DbValue::Empty => Response::NilStr,
         }
     }
 }
@@ -119,7 +140,29 @@ impl From<Vec<&StreamElement>> for Response {
                 .into_iter()
                 .map(|element| {
                     Response::List(vec![
-                        Response::Str(element.id.clone()),
+                        Response::Str(element.id.to_string()),
+                        Response::List(
+                            element
+                                .value
+                                .iter()
+                                .flat_map(|(k, v)| [k.clone().into(), v.clone().into()])
+                                .collect(),
+                        ),
+                    ])
+                })
+                .collect(),
+        )
+    }
+}
+
+impl From<Vec<StreamElement>> for Response {
+    fn from(value: Vec<StreamElement>) -> Self {
+        Response::List(
+            value
+                .into_iter()
+                .map(|element| {
+                    Response::List(vec![
+                        Response::Str(element.id.to_string()),
                         Response::List(
                             element
                                 .value

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{collections::{HashMap, HashSet, VecDeque}, fmt::Display};
 
 use indexmap::IndexMap;
 
@@ -71,12 +71,43 @@ impl From<String> for DbValue {
 
 #[derive(Debug, Clone)]
 pub struct StreamElement {
-    pub id: String,
+    pub id: StreamId,
     pub value: IndexMap<String, String>,
 }
 
 impl StreamElement {
-    pub fn new(id: String, value: IndexMap<String, String>) -> Self {
+    pub fn new(id: StreamId, value: IndexMap<String, String>) -> Self {
         StreamElement { id, value }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StreamId {
+    timestamp: u128,
+    sequence: usize
+}
+
+impl StreamId {
+    pub fn new(timestamp: u128, sequence: usize) -> Self {
+        Self {
+            timestamp,
+            sequence
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}-{}", self.timestamp, self.sequence)
+    }
+}
+
+impl Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.timestamp, self.sequence)
+    }
+}
+
+impl From<StreamId> for (u128, usize) {
+    fn from(value: StreamId) -> Self {
+        (value.timestamp, value.sequence)
     }
 }

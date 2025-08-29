@@ -4,7 +4,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::{
-    command_handler::CommandHandler, db_item::DbItem, db_value::DbValue, error::RedisError, response::Response, shard_map::ShardMapEntry, state::{ConnectionState, ServerState}
+    command_handler::CommandHandler,
+    db_item::DbItem,
+    db_value::DbValue,
+    error::RedisError,
+    response::Response,
+    shard_map::ShardMapEntry,
+    state::{ConnectionState, ServerState},
 };
 
 pub struct SADDHandler;
@@ -105,8 +111,8 @@ impl CommandHandler for SISMEMBERHandler {
         _connection_state: ConnectionState,
         _message_len: usize,
     ) -> Result<Vec<Bytes>, RedisError> {
-        let [_, key, entry] = <[String; 3]>::try_from(args)
-            .map_err(|_| RedisError::WrongArgs("SISMEMBER"))?;
+        let [_, key, entry] =
+            <[String; 3]>::try_from(args).map_err(|_| RedisError::WrongArgs("SISMEMBER"))?;
 
         let value = server_state.db.get(&key).await;
         let result = match value.as_deref() {
@@ -133,27 +139,31 @@ impl CommandHandler for SINTERHandler {
         _message_len: usize,
     ) -> Result<Vec<Bytes>, RedisError> {
         if args.len() != 3 {
-            return Err(RedisError::WrongArgs("SINTER"))
+            return Err(RedisError::WrongArgs("SINTER"));
         }
-        let [_, key1, key2] =
-            <[String; 3]>::try_from(args).unwrap();
+        let [_, key1, key2] = <[String; 3]>::try_from(args).unwrap();
 
-        let result = server_state.db.with_values(&[key1.clone(), key2.clone()], |values| {
-            let item1 = values[0];
-            let item2 = values[1];
-            let value1 = item1.map(|it| it.value());
-            let value2 = item2.map(|it| it.value());
+        let result = server_state
+            .db
+            .with_values(&[key1.clone(), key2.clone()], |values| {
+                let item1 = values[0];
+                let item2 = values[1];
+                let value1 = item1.map(|it| it.value());
+                let value2 = item2.map(|it| it.value());
 
-            match (value1, value2) {
-                (Some(DbValue::Set(set1)), Some(DbValue::Set(set2))) => {
-                    Ok(set1.intersection(set2).cloned().collect())
+                match (value1, value2) {
+                    (Some(DbValue::Set(set1)), Some(DbValue::Set(set2))) => {
+                        Ok(set1.intersection(set2).cloned().collect())
+                    }
+                    (Some(DbValue::Set(_)), None)
+                    | (None, Some(DbValue::Set(_)))
+                    | (None, None) => Ok(vec![]),
+                    (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => {
+                        return Err(RedisError::WrongType)
+                    }
                 }
-                (Some(DbValue::Set(_)), None) | (None, Some(DbValue::Set(_))) | (None, None) => {
-                    Ok(vec![])
-                }
-                (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => return Err(RedisError::WrongType),
-            }
-        }).await?;
+            })
+            .await?;
 
         let resp: Response = result.into_iter().collect();
 

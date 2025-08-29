@@ -6,15 +6,17 @@ use futures::future::join_all;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use thiserror::Error;
-use tokio::time::interval;
+use tokio::{sync::oneshot, time::Instant};
 
 use crate::{
+    blocking::BlockMsg,
     command_handler::CommandHandler,
     db_item::DbItem,
-    db_value::{DbValue, StreamElement},
+    db_value::{DbValue, StreamElement, StreamId},
     error::RedisError,
     response::Response,
     state::{ConnectionState, ServerState},
+    utils::sleep_until_if,
 };
 
 pub struct XADDHandler;
@@ -30,33 +32,30 @@ impl CommandHandler for XADDHandler {
         if args.len() < 5 {
             return Err(RedisError::WrongArgs("XADD"));
         }
-        let key = &args[1];
-        server_state
+        let key = args.remove(1);
+        let mut item = server_state
             .db
-            .with_entry(key.clone(), |entry| {
-                let item = entry.or_insert(DbItem::new(DbValue::Stream(vec![]), None));
+            .get_mut_or_insert(key.clone(), DbItem::new(DbValue::Stream(vec![]), None))
+            .await;
+        if let DbValue::Stream(ref mut stream_vec) = item.value_mut() {
+            let id = generate_and_validate_stream_id(&stream_vec[..], &args[1])?;
 
-                let result;
-                if let DbValue::Stream(ref mut stream_vec) = item.value_mut() {
-                    let id = generate_and_validate_stream_id(&stream_vec[..], &args[2])?;
+            let mut map = IndexMap::new();
 
-                    let mut map = IndexMap::new();
+            for (stream_key, value) in args.drain(2..).tuples() {
+                map.insert(stream_key, value);
+            }
 
-                    for (stream_key, value) in args.drain(3..).tuples() {
-                        map.insert(stream_key, value);
-                    }
+            let new_stream_element = StreamElement::new(id, map);
+            stream_vec.push(new_stream_element);
 
-                    let new_stream_element = StreamElement::new(id.clone(), map);
-                    stream_vec.push(new_stream_element);
+            let msg = BlockMsg::XReadUnblock(key, item);
+            server_state.block_tx.send(msg).await?;
 
-                    result = Ok(vec![Response::Str(id).to_bytes()]);
-                } else {
-                    result = Err(RedisError::WrongType);
-                }
-                item.update_timestamp();
-                result
-            })
-            .await
+            Ok(vec![Response::Str(id.to_string()).to_bytes()])
+        } else {
+            Err(RedisError::WrongType)
+        }
     }
 }
 
@@ -77,31 +76,31 @@ impl CommandHandler for XRangeHandler {
         let value = server_state.db.get(&key).await;
         match value.as_deref() {
             Some(DbValue::Stream(stream_vec)) => {
-                let (start_timestamp, start_sequence): (u128, usize) = {
+                let start_id = {
                     if start == "-" {
-                        (0, 0)
+                        StreamId::new(0, 0)
                     } else {
                         let (start_timestamp, start_sequence) = if start.contains("-") {
                             start.split_once("-").unwrap()
                         } else {
                             (start.as_str(), "0")
                         };
-                        (
+                        StreamId::new(
                             start_timestamp.parse().unwrap(),
                             start_sequence.parse().unwrap(),
                         )
                     }
                 };
-                let (end_timestamp, end_sequence): (u128, usize) = {
+                let end_id: StreamId = {
                     if end == "+" {
-                        (u128::MAX, usize::MAX)
+                        StreamId::new(u128::MAX, usize::MAX)
                     } else {
                         let (end_timestamp, end_sequence) = if end.contains("-") {
                             end.split_once("-").unwrap()
                         } else {
                             (end.as_str(), "inf")
                         };
-                        (
+                        StreamId::new(
                             end_timestamp.parse().unwrap(),
                             if end_sequence == "inf" {
                                 usize::MAX
@@ -115,16 +114,8 @@ impl CommandHandler for XRangeHandler {
                 let mut result_vec = Vec::new();
 
                 for value in stream_vec {
-                    let (timestamp, sequence) = value.id.split_once("-").unwrap();
-                    let (timestamp, sequence): (u128, usize) =
-                        (timestamp.parse().unwrap(), sequence.parse().unwrap());
-
-                    if timestamp > start_timestamp
-                        || (timestamp == start_timestamp && sequence >= start_sequence)
-                    {
-                        if timestamp > end_timestamp
-                            || (timestamp == end_timestamp && sequence > end_sequence)
-                        {
+                    if value.id >= start_id {
+                        if value.id > end_id {
                             break;
                         }
                         result_vec.push(value);
@@ -153,8 +144,6 @@ impl CommandHandler for XReadHandler {
         }
         if let Some(arg) = args.get(1) {
             if arg.to_ascii_lowercase() == "block" {
-                let mut interval = interval(Duration::from_millis(10));
-
                 let timeout: i64 = args[2].parse().map_err(|_| StreamError::InvalidTimeout)?;
                 if timeout < 0 {
                     return Err(StreamError::NegativeTimeout.into());
@@ -163,7 +152,7 @@ impl CommandHandler for XReadHandler {
 
                 let expires = if timeout > 0 {
                     Some(
-                        SystemTime::now()
+                        Instant::now()
                             .checked_add(Duration::from_millis(timeout))
                             .unwrap(),
                     )
@@ -178,50 +167,49 @@ impl CommandHandler for XReadHandler {
                 let key = &args[4];
                 let start = &args[5];
 
-                let (start_timestamp, start_sequence) = {
+                // Extract the timestamp, sequence number, and list offset to look at.
+                // If there are already results in scope, return immediately rather than block
+                let (start_id, offset) = {
                     let value = server_state.db.get(key).await;
                     let stream_vec = value.as_deref().and_then(|val| val.to_stream_vec());
-                    parse_id_with_dollar_sign(&start, stream_vec)?
-                };
-
-                loop {
-                    interval.tick().await;
-
-                    if expires.is_some_and(|exp| exp < SystemTime::now()) {
-                        return Ok(vec!["$-1\r\n".into()]);
-                    }
-
-                    let value = server_state.db.get(key).await;
-                    if let Some(DbValue::Stream(stream_vec)) = value.as_deref() {
-                        if let Some(last) = stream_vec.last() {
-                            let (timestamp, sequence) = parse_id(&last.id)?;
-                            if timestamp > start_timestamp
-                                || (timestamp == start_timestamp && sequence > start_sequence)
-                            {
-                                let mut j = 0usize;
-
-                                let (mut timestamp, mut sequence) = parse_id(&stream_vec[0].id)?;
-                                while timestamp < start_timestamp
-                                    || (timestamp == start_timestamp && sequence <= start_sequence)
-                                {
-                                    j += 1;
-
-                                    (timestamp, sequence) = parse_id(&stream_vec[j].id)?;
-                                }
-
-                                let result_vec = gather_stream_read_results(
-                                    stream_vec[j..].iter().collect(),
-                                    start_timestamp,
-                                    start_sequence,
-                                    key.clone(),
-                                )?;
-
-                                let resp_value = Response::List(vec![result_vec].into());
-
-                                return Ok(vec![resp_value.to_bytes()]);
-                            }
+                    let start_id = parse_id_with_dollar_sign(&start, stream_vec)?;
+                    let mut offset = 0;
+                    if let Some(stream_vec) = stream_vec {
+                        while offset < stream_vec.len() && stream_vec[offset].id <= start_id {
+                            offset += 1;
+                        }
+                        println!("{offset}, {stream_vec:?}");
+                        if offset < stream_vec.len() {
+                            let result_vec = gather_stream_read_results(
+                                stream_vec[offset..].iter().collect(),
+                                start_id,
+                                key.clone(),
+                            )?;
+                            let resp = Response::List(vec![result_vec]);
+                            return Ok(vec![resp.to_bytes()]);
                         }
                     }
+                    (start_id, offset)
+                };
+
+                let (returner_tx, returner_rx) = oneshot::channel();
+                let msg = BlockMsg::XRead {
+                    key: key.to_string(),
+                    expires,
+                    id: start_id,
+                    offset,
+                    returner: returner_tx,
+                };
+                server_state.block_tx.send(msg).await?;
+
+                tokio::select! {
+                    results = returner_rx => {
+                        if let Ok(results) = results {
+                            let resp_value = Response::List(vec![Response::from_stream_owned(key.to_string(), results)]);
+                            return Ok(vec![resp_value.to_bytes()]);
+                        }
+                    }
+                    _ = sleep_until_if(expires) => return Ok(vec![Response::NilArr.to_bytes()]),
                 }
             }
         }
@@ -243,7 +231,7 @@ impl CommandHandler for XReadHandler {
             .into_iter()
             .zip(starts)
             .map(|(k, start)| async {
-                let (start_timestamp, start_sequence) = parse_id(start)?;
+                let start_id = parse_id(start)?;
                 gather_stream_read_results(
                     server_state
                         .clone()
@@ -256,17 +244,14 @@ impl CommandHandler for XReadHandler {
                         .ok_or(RedisError::WrongType)?
                         .iter()
                         .collect(),
-                    start_timestamp,
-                    start_sequence,
+                    start_id,
                     k.clone(),
                 )
             })
             .collect();
 
-        let result_vec: Result<Vec<Response>, _> = join_all(futures_vec)
-            .await
-            .into_iter()
-            .collect();
+        let result_vec: Result<Vec<Response>, _> =
+            join_all(futures_vec).await.into_iter().collect();
         Ok(vec![Response::List(result_vec?).to_bytes()])
     }
 }
@@ -274,11 +259,9 @@ impl CommandHandler for XReadHandler {
 fn generate_and_validate_stream_id(
     stream_vec: &[StreamElement],
     id: &str,
-) -> Result<String, StreamError> {
+) -> Result<StreamId, StreamError> {
     if let Some(last_element) = stream_vec.last() {
-        let (last_timestamp, last_sequence) = last_element.id.split_once("-").unwrap();
-        let last_timestamp: u128 = last_timestamp.parse().unwrap();
-        let last_sequence: usize = last_sequence.parse().unwrap();
+        let (last_timestamp, last_sequence) = last_element.id.into();
 
         if id == "*" {
             let current_time = SystemTime::now();
@@ -291,7 +274,7 @@ fn generate_and_validate_stream_id(
                 0
             };
 
-            Ok(format!("{timestamp}-{sequence}"))
+            Ok(StreamId::new(timestamp, sequence))
         } else {
             if id == "0-0" {
                 return Err(StreamError::IdPositive);
@@ -320,7 +303,7 @@ fn generate_and_validate_stream_id(
                 sequence
             };
 
-            Ok(format!("{timestamp}-{sequence}"))
+            Ok(StreamId::new(timestamp, sequence))
         }
     } else {
         if id == "*" {
@@ -328,7 +311,7 @@ fn generate_and_validate_stream_id(
             let since_epoch = current_time.duration_since(UNIX_EPOCH).unwrap();
             let timestamp = since_epoch.as_millis();
 
-            Ok(format!("{timestamp}-0"))
+            Ok(StreamId::new(timestamp, 0))
         } else {
             let (timestamp, sequence) = id.split_once("-").ok_or(StreamError::InvalidId)?;
             let timestamp: u128 = timestamp.parse().map_err(|_| StreamError::InvalidId)?;
@@ -342,7 +325,7 @@ fn generate_and_validate_stream_id(
                 sequence.parse().map_err(|_| StreamError::InvalidId)?
             };
 
-            Ok(format!("{timestamp}-{sequence}"))
+            Ok(StreamId::new(timestamp, sequence))
         }
     }
 }
@@ -350,54 +333,43 @@ fn generate_and_validate_stream_id(
 fn parse_id_with_dollar_sign(
     input: &str,
     stream_vec: Option<&Vec<StreamElement>>,
-) -> Result<(u128, usize), StreamError> {
-    let (start_timestamp, start_sequence) = if input == "$" {
-        stream_vec
+) -> Result<StreamId, StreamError> {
+    if input == "$" {
+        Ok(stream_vec
             .and_then(|stream_vec| stream_vec.last())
-            .map(|entry| entry.id.split_once("-").unwrap())
-            .unwrap_or(("0", "0"))
+            .map(|entry| entry.id)
+            .unwrap_or(StreamId::new(0, 0)))
     } else {
-        input
-            .split_once("-")
-            .expect(&format!("Start id is invalid: {input}"))
-    };
-    let start_timestamp = start_timestamp
-        .parse()
-        .map_err(|_| StreamError::InvalidId)?;
-    let start_sequence = start_sequence.parse().map_err(|_| StreamError::InvalidId)?;
-    Ok((start_timestamp, start_sequence))
+        let (timestamp, sequence) = input.split_once("-").ok_or(StreamError::InvalidId)?;
+        Ok(StreamId::new(
+            timestamp.parse().map_err(|_| StreamError::InvalidId)?,
+            sequence.parse().map_err(|_| StreamError::InvalidId)?,
+        ))
+    }
 }
 
 fn gather_stream_read_results<'a>(
     stream_vec: Vec<&'a StreamElement>,
-    start_timestamp: u128,
-    start_sequence: usize,
+    start_id: StreamId,
     key: String,
 ) -> Result<Response, RedisError> {
     let mut results_vec = Vec::new();
 
     for element in stream_vec {
-        let (timestamp, sequence) = element.id.split_once("-").ok_or(StreamError::InvalidId)?;
-        let timestamp: u128 = timestamp.parse().map_err(|_| StreamError::InvalidId)?;
-        let sequence: usize = sequence.parse().map_err(|_| StreamError::InvalidId)?;
-
-        if timestamp > start_timestamp
-            || (timestamp == start_timestamp && sequence > start_sequence)
-        {
+        if element.id >= start_id {
             results_vec.push(element);
         }
     }
-
-    Ok(Response::from_stream(key, results_vec))
+    Ok(Response::from_stream(key, &results_vec[..]))
 }
 
-fn parse_id(input: &str) -> Result<(u128, usize), StreamError> {
-    let (start_timestamp, start_sequence) = input
-        .split_once("-")
-        .expect(&format!("Start id is invalid: {input}"));
-    let start_timestamp = start_timestamp.parse().map_err(|_| StreamError::InvalidId)?;
+fn parse_id(input: &str) -> Result<StreamId, StreamError> {
+    let (start_timestamp, start_sequence) = input.split_once("-").ok_or(StreamError::InvalidId)?;
+    let start_timestamp = start_timestamp
+        .parse()
+        .map_err(|_| StreamError::InvalidId)?;
     let start_sequence = start_sequence.parse().map_err(|_| StreamError::InvalidId)?;
-    Ok((start_timestamp, start_sequence))
+    Ok(StreamId::new(start_timestamp, start_sequence))
 }
 
 #[derive(Error, Debug)]

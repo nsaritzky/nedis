@@ -4,7 +4,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::{
-    command_handler::CommandHandler, db_item::DbItem, db_value::DbValue, error::RedisError, redis_value::RedisValue, state::{ConnectionState, ServerState}
+    command_handler::CommandHandler,
+    db_item::DbItem,
+    db_value::DbValue,
+    error::RedisError,
+    redis_value::RedisValue,
+    state::{ConnectionState, ServerState},
 };
 
 pub struct IncrHandler;
@@ -29,7 +34,10 @@ impl CommandHandler for IncrHandler {
                     let item = occ.get();
                     if let DbValue::String(old_val) = item.value() {
                         if let Ok(n) = old_val.parse::<isize>() {
-                            occ.insert(DbItem::new(DbValue::String((n + 1).to_string()), item.expires_at()));
+                            occ.insert(DbItem::new(
+                                DbValue::String((n + 1).to_string()),
+                                item.expires_at(),
+                            ));
                             Some(n + 1)
                         } else {
                             None
@@ -77,7 +85,7 @@ impl CommandHandler for WatchHandler {
         mut args: Vec<String>,
         _server_state: ServerState,
         mut connection_state: ConnectionState,
-        _message_len: usize
+        _message_len: usize,
     ) -> Result<Vec<Bytes>, RedisError> {
         connection_state.watch_keys(args.drain(1..).collect()).await;
         Ok(vec!["+OK\r\n".into()])
@@ -92,7 +100,7 @@ impl CommandHandler for UnwatchHandler {
         _args: Vec<String>,
         _server_state: ServerState,
         mut connection_state: ConnectionState,
-        _message_len: usize
+        _message_len: usize,
     ) -> Result<Vec<Bytes>, RedisError> {
         connection_state.drain_watched_keys().await;
         Ok(vec!["$-1\r\n".into()])

@@ -1,6 +1,7 @@
 mod args;
 mod blocking;
 mod command_handler;
+mod command_parser;
 mod command_registry;
 mod db;
 mod db_item;
@@ -26,6 +27,7 @@ mod state;
 mod stream;
 mod transactions;
 mod utils;
+mod geo;
 
 use std::{
     future,
@@ -331,6 +333,7 @@ async fn process_input(
                     message_len,
                     server_state.clone(),
                     connection_state.clone(),
+                    true,
                 )
                 .await?
             };
@@ -351,10 +354,14 @@ pub async fn execute_command(
     message_len: usize,
     server_state: ServerState,
     connection_state: ConnectionState,
+    needs_tlock: bool,
 ) -> anyhow::Result<Vec<Bytes>> {
     let command = v[0].to_ascii_uppercase();
     let server_state_clone = server_state.clone();
-    let _tlock = server_state_clone.transaction_lock.read().await;
+    let _tlock;
+    if needs_tlock {
+        _tlock = server_state_clone.transaction_lock.read().await;
+    }
 
     if let Some(handler) = REGISTRY.get(command.as_str()) {
         match handler
@@ -417,24 +424,25 @@ async fn handle_exec(
         let mut tq = cs.transaction_queue.lock().await;
         tq.drain(..).collect()
     };
-    let _ = server_state.transaction_lock.write().await;
+    let _tlock = server_state.transaction_lock.write().await;
 
     // If any watched keys have been updated, abort the transaction
     let watched_keys = connection_state.drain_watched_keys().await;
     let keys = watched_keys.keys().map(|s| s.as_str()).collect_vec();
+    let now = SystemTime::now();
     if !server_state
         .db
         .with_key_values(&keys, |pairs| {
             pairs.into_iter().all(|(key, item)| {
                 item.is_some_and(|it| {
-                    it.expires_at().is_none_or(|t| t < SystemTime::now())
+                    it.expires_at().is_none_or(|t| t < now)
                         && it.updated_at() <= *watched_keys.get(*key).unwrap()
                 })
             })
         })
         .await
     {
-        return Ok(vec!["$-1\r\n".into()]);
+        return Ok(vec![Response::NilStr.to_bytes()]);
     }
 
     buf.put_slice(format!("*{}\r\n", transactions.len()).as_bytes());
@@ -445,6 +453,7 @@ async fn handle_exec(
             message_len,
             server_state.clone(),
             connection_state.clone(),
+            false,
         )
         .await?;
         for resp in responses {
