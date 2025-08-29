@@ -1,7 +1,6 @@
 mod args;
 mod blocking;
 mod command_handler;
-mod command_parser;
 mod command_registry;
 mod db;
 mod db_item;
